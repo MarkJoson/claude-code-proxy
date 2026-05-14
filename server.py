@@ -15,6 +15,10 @@ import re
 from datetime import datetime
 import sys
 
+import litellm
+litellm.ssl_verify = False
+# litellm.drop_params = True
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -179,7 +183,7 @@ class Tool(BaseModel):
     input_schema: Dict[str, Any]
 
 class ThinkingConfig(BaseModel):
-    enabled: bool = True
+    type: Literal["enabled", "disabled", "adaptive"] = "adaptive"
 
 class MessagesRequest(BaseModel):
     model: str
@@ -246,6 +250,13 @@ class MessagesRequest(BaseModel):
             elif clean_v in OPENAI_MODELS and not v.startswith('openai/'):
                 new_model = f"openai/{clean_v}"
                 mapped = True # Technically mapped to add prefix
+            elif clean_v.startswith('claude-') and not v.startswith('anthropic/'):
+                # Other Claude models (like opus) map to BIG_MODEL like sonnet
+                if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
+                    new_model = f"gemini/{BIG_MODEL}"
+                else:
+                    new_model = f"openai/{BIG_MODEL}"
+                mapped = True
         # --- Mapping Logic --- END ---
 
         if mapped:
@@ -271,7 +282,7 @@ class TokenCountRequest(BaseModel):
     thinking: Optional[ThinkingConfig] = None
     tool_choice: Optional[Dict[str, Any]] = None
     original_model: Optional[str] = None  # Will store the original model name
-    
+
     @field_validator('model')
     def validate_model_token_count(cls, v, info): # Renamed to avoid conflict
         # Use the same logic as MessagesRequest validator
@@ -319,6 +330,13 @@ class TokenCountRequest(BaseModel):
             elif clean_v in OPENAI_MODELS and not v.startswith('openai/'):
                 new_model = f"openai/{clean_v}"
                 mapped = True # Technically mapped to add prefix
+            elif clean_v.startswith('claude-') and not v.startswith('anthropic/'):
+                # Other Claude models (like opus) map to BIG_MODEL like sonnet
+                if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
+                    new_model = f"gemini/{BIG_MODEL}"
+                else:
+                    new_model = f"openai/{BIG_MODEL}"
+                mapped = True
         # --- Mapping Logic --- END ---
 
         if mapped:
@@ -428,16 +446,17 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             # Simple string format
             messages.append({"role": "system", "content": anthropic_request.system})
         elif isinstance(anthropic_request.system, list):
-            # List of content blocks
-            system_text = ""
+            # Take only the longest text block (match server2.py behavior)
+            # Claude Code sends multiple system blocks; the longest one is the main prompt
+            texts = []
             for block in anthropic_request.system:
                 if hasattr(block, 'type') and block.type == "text":
-                    system_text += block.text + "\n\n"
+                    texts.append(block.text)
                 elif isinstance(block, dict) and block.get("type") == "text":
-                    system_text += block.get("text", "") + "\n\n"
-            
-            if system_text:
-                messages.append({"role": "system", "content": system_text.strip()})
+                    texts.append(block.get("text", ""))
+            if texts:
+                system_text = max(texts, key=len)
+                messages.append({"role": "system", "content": system_text})
     
     # Add conversation messages
     for idx, msg in enumerate(anthropic_request.messages):
@@ -554,16 +573,21 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     
     # Create LiteLLM request dict
     litellm_request = {
-        "model": anthropic_request.model,  # it understands "anthropic/claude-x" format
+        "model": anthropic_request.model,
         "messages": messages,
-        "max_completion_tokens": max_tokens,
+        "max_tokens": max_tokens,
         "temperature": anthropic_request.temperature,
-        "stream": anthropic_request.stream,
+        "stream": False,  # Non-streaming only for reliability (match server2.py)
     }
 
-    # Only include thinking field for Anthropic models
-    if anthropic_request.thinking and anthropic_request.model.startswith("anthropic/"):
-        litellm_request["thinking"] = anthropic_request.thinking
+    # Pass thinking through extra_body
+    if anthropic_request.thinking:
+        thinking_dict = anthropic_request.thinking
+        if hasattr(thinking_dict, 'dict'):
+            thinking_dict = thinking_dict.dict()
+        elif hasattr(thinking_dict, 'model_dump'):
+            thinking_dict = thinking_dict.model_dump()
+        litellm_request["extra_body"] = {"thinking": thinking_dict}
 
     # Add optional parameters if present
     if anthropic_request.stop_sequences:
@@ -801,7 +825,7 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
         # Create Anthropic-style response
         anthropic_response = MessagesResponse(
             id=response_id,
-            model=original_request.model,
+            model=original_request.original_model or original_request.model,
             role="assistant",
             content=content,
             stop_reason=stop_reason,
@@ -842,7 +866,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 'id': message_id,
                 'type': 'message',
                 'role': 'assistant',
-                'model': original_request.model,
+                'model': original_request.original_model or original_request.model,
                 'content': [],
                 'stop_reason': None,
                 'stop_sequence': None,
@@ -1116,16 +1140,15 @@ async def create_message(
             clean_model = clean_model[len("anthropic/"):]
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/"):]
-        
+
         logger.debug(f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}")
-        
+
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
-        
+
         # Determine which API key to use based on the model
         if request.model.startswith("openai/"):
             litellm_request["api_key"] = OPENAI_API_KEY
-            # Use custom OpenAI base URL if configured
             if OPENAI_BASE_URL:
                 litellm_request["api_base"] = OPENAI_BASE_URL
                 logger.debug(f"Using OpenAI API key and custom base URL {OPENAI_BASE_URL} for model: {request.model}")
@@ -1143,7 +1166,7 @@ async def create_message(
         else:
             litellm_request["api_key"] = ANTHROPIC_API_KEY
             logger.debug(f"Using Anthropic API key for model: {request.model}")
-        
+
         # For OpenAI models - modify request format to work with limitations
         if "openai" in litellm_request["model"] and "messages" in litellm_request:
             logger.debug(f"Processing OpenAI model request: {litellm_request['model']}")
@@ -1285,48 +1308,26 @@ async def create_message(
         # Only log basic info about the request, not the full details
         logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
         
-        # Handle streaming mode
-        if request.stream:
-            # Use LiteLLM for streaming
-            num_tools = len(request.tools) if request.tools else 0
-            
-            log_request_beautifully(
-                "POST", 
-                raw_request.url.path, 
-                display_model, 
-                litellm_request.get('model'),
-                len(litellm_request['messages']),
-                num_tools,
-                200  # Assuming success at this point
-            )
-            # Ensure we use the async version for streaming
-            response_generator = await litellm.acompletion(**litellm_request)
-            
-            return StreamingResponse(
-                handle_streaming(response_generator, request),
-                media_type="text/event-stream"
-            )
-        else:
-            # Use LiteLLM for regular completion
-            num_tools = len(request.tools) if request.tools else 0
-            
-            log_request_beautifully(
-                "POST", 
-                raw_request.url.path, 
-                display_model, 
-                litellm_request.get('model'),
-                len(litellm_request['messages']),
-                num_tools,
-                200  # Assuming success at this point
-            )
-            start_time = time.time()
-            litellm_response = litellm.completion(**litellm_request)
-            logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
-            
-            # Convert LiteLLM response to Anthropic format
-            anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
-            
-            return anthropic_response
+        # Always use non-streaming (match server2.py for reliability)
+        num_tools = len(request.tools) if request.tools else 0
+
+        log_request_beautifully(
+            "POST",
+            raw_request.url.path,
+            display_model,
+            litellm_request.get('model'),
+            len(litellm_request['messages']),
+            num_tools,
+            200
+        )
+        start_time = time.time()
+        litellm_response = litellm.completion(**litellm_request)
+        logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
+
+        # Convert LiteLLM response to Anthropic format
+        anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+
+        return anthropic_response
                 
     except Exception as e:
         import traceback
