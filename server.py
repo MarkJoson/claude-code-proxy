@@ -183,7 +183,7 @@ class Tool(BaseModel):
     input_schema: Dict[str, Any]
 
 class ThinkingConfig(BaseModel):
-    type: Literal["enabled", "disabled", "adaptive"] = "adaptive"
+    type: Literal["enabled", "disabled", "adaptive", "auto"] = "auto"
 
 class MessagesRequest(BaseModel):
     model: str
@@ -587,6 +587,13 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             thinking_dict = thinking_dict.dict()
         elif hasattr(thinking_dict, 'model_dump'):
             thinking_dict = thinking_dict.model_dump()
+        
+        # 仅对 Qwen3 系列模型做映射
+        model_lower = anthropic_request.model.lower()
+        if "qwen3" in model_lower and isinstance(thinking_dict, dict):
+            if thinking_dict.get("type") == "adaptive":
+                thinking_dict["type"] = "auto"
+        
         litellm_request["extra_body"] = {"thinking": thinking_dict}
 
     # Add optional parameters if present
