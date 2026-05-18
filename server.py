@@ -1202,7 +1202,37 @@ async def create_message(
             200
         )
         start_time = time.time()
-        litellm_response = litellm.completion(**litellm_request)
+        # Retry transient upstream errors (rate limits, 5xx, timeouts) with
+        # exponential backoff. Configurable via LITELLM_MAX_RETRIES env.
+        max_retries = int(os.environ.get("LITELLM_MAX_RETRIES", "3"))
+        base_delay = float(os.environ.get("LITELLM_RETRY_BASE_DELAY", "2"))
+        litellm_response = None
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                litellm_response = litellm.completion(**litellm_request)
+                break
+            except Exception as exc:
+                last_exc = exc
+                status_code = getattr(exc, "status_code", None)
+                exc_name = type(exc).__name__
+                is_transient = (
+                    isinstance(exc, getattr(litellm, "RateLimitError", tuple()))
+                    or isinstance(exc, getattr(litellm, "Timeout", tuple()))
+                    or isinstance(exc, getattr(litellm, "APIConnectionError", tuple()))
+                    or isinstance(exc, getattr(litellm, "InternalServerError", tuple()))
+                    or isinstance(exc, getattr(litellm, "ServiceUnavailableError", tuple()))
+                    or status_code in (408, 425, 429, 500, 502, 503, 504)
+                )
+                if not is_transient or attempt >= max_retries:
+                    raise
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    f"⏳ Transient error ({exc_name}, status={status_code}) "
+                    f"on attempt {attempt + 1}/{max_retries + 1}; "
+                    f"retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
         logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
 
         # Convert LiteLLM response to Anthropic format
@@ -1317,16 +1347,13 @@ async def count_tokens(
                 200  # Assuming success at this point
             )
             
-            # Prepare token counter arguments
+            # Prepare token counter arguments — token_counter is a local
+            # tokenizer call, so no api_base / api_key is accepted or needed.
             token_counter_args = {
                 "model": converted_request["model"],
                 "messages": converted_request["messages"],
             }
-            
-            # Add custom base URL for OpenAI models if configured
-            if request.model.startswith("openai/") and OPENAI_BASE_URL:
-                token_counter_args["api_base"] = OPENAI_BASE_URL
-            
+
             # Count tokens
             token_count = token_counter(**token_counter_args)
             
