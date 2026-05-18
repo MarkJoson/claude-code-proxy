@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
+import asyncio
 from fastapi.responses import JSONResponse, StreamingResponse
 import litellm
 import uuid
@@ -1210,7 +1211,9 @@ async def create_message(
         last_exc = None
         for attempt in range(max_retries + 1):
             try:
-                litellm_response = litellm.completion(**litellm_request)
+                # Async call so a slow upstream / retry sleep doesn't block
+                # other concurrent requests on the event loop.
+                litellm_response = await litellm.acompletion(**litellm_request)
                 break
             except Exception as exc:
                 last_exc = exc
@@ -1232,7 +1235,7 @@ async def create_message(
                     f"on attempt {attempt + 1}/{max_retries + 1}; "
                     f"retrying in {delay:.1f}s"
                 )
-                time.sleep(delay)
+                await asyncio.sleep(delay)
         logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
 
         # Convert LiteLLM response to Anthropic format
@@ -1354,8 +1357,9 @@ async def count_tokens(
                 "messages": converted_request["messages"],
             }
 
-            # Count tokens
-            token_count = token_counter(**token_counter_args)
+            # Count tokens off the event loop — tokenization is CPU-bound and
+            # would otherwise block other concurrent requests.
+            token_count = await asyncio.to_thread(token_counter, **token_counter_args)
             
             # Return Anthropic-style response
             return TokenCountResponse(input_tokens=token_count)
@@ -1423,8 +1427,34 @@ def log_request_beautifully(method, path, claude_model, openai_model, num_messag
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--help":
-        print("Run with: uvicorn server:app --reload --host 0.0.0.0 --port 8082")
+        print("Run with: uvicorn server:app --host 0.0.0.0 --port 8082 --workers 4")
         sys.exit(0)
-    
-    # Configure uvicorn to run with minimal logs
-    uvicorn.run(app, host="0.0.0.0", port=8082, log_level="error")
+
+    # Concurrency tuning via env:
+    #   PORT          — listen port (default 8082)
+    #   WORKERS       — number of worker processes (default 1; set >1 for true
+    #                   multi-core parallelism, but each worker is a separate
+    #                   process so module-level state is not shared)
+    #   BACKLOG       — TCP accept queue size (default 2048)
+    #   LIMIT_CONCURRENCY — max in-flight requests per worker before 503 (None=no limit)
+    port = int(os.environ.get("PORT", "8082"))
+    workers = int(os.environ.get("WORKERS", "16"))
+    backlog = int(os.environ.get("BACKLOG", "2048"))
+    limit_concurrency_env = os.environ.get("LIMIT_CONCURRENCY")
+    limit_concurrency = int(limit_concurrency_env) if limit_concurrency_env else None
+
+    uvicorn_kwargs = {
+        "host": "0.0.0.0",
+        "port": port,
+        "log_level": "error",
+        "backlog": backlog,
+        "timeout_keep_alive": 75,
+    }
+    if limit_concurrency is not None:
+        uvicorn_kwargs["limit_concurrency"] = limit_concurrency
+
+    if workers > 1:
+        # Multi-worker mode requires an import string, not the app object.
+        uvicorn.run("server:app", workers=workers, **uvicorn_kwargs)
+    else:
+        uvicorn.run(app, **uvicorn_kwargs)
