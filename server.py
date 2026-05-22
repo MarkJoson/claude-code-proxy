@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
 import asyncio
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 import litellm
 import uuid
 import time
@@ -15,6 +15,28 @@ from dotenv import load_dotenv
 import re
 from datetime import datetime
 import sys
+from pathlib import Path
+
+from trace_db import (
+    build_agent_tree,
+    build_history_chains,
+    build_timeline,
+    clear_traces,
+    get_agent_call,
+    get_request,
+    get_session,
+    get_tool_event,
+    headers_to_trace,
+    list_requests,
+    list_sessions,
+    model_to_plain,
+    monotonic_ms,
+    new_trace_id,
+    record_request_completed as trace_request_completed,
+    record_request_failed as trace_request_failed,
+    record_request_started as trace_request_started,
+    snapshot_stats,
+)
 
 import litellm
 litellm.ssl_verify = False
@@ -104,6 +126,9 @@ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
 # Default to latest OpenAI models if not set
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
+
+# Test-only mode: record real client requests but skip upstream LLM calls.
+TRACE_ECHO_ONLY = os.environ.get("CC_TRACE_ECHO_ONLY", "false").lower() in {"1", "true", "yes", "on"}
 
 # List of OpenAI models
 OPENAI_MODELS = [
@@ -372,6 +397,28 @@ class MessagesResponse(BaseModel):
     stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]] = None
     stop_sequence: Optional[str] = None
     usage: Usage
+
+def estimate_trace_echo_tokens(value: Any) -> int:
+    try:
+        text = json.dumps(model_to_plain(value), ensure_ascii=False)
+    except Exception:
+        text = str(value)
+    return max(1, len(text) // 4)
+
+
+def build_trace_echo_response(original_request: MessagesRequest) -> MessagesResponse:
+    return MessagesResponse(
+        id=f"msg_{uuid.uuid4().hex[:24]}",
+        model=original_request.original_model or original_request.model,
+        role="assistant",
+        content=[{"type": "text", "text": "TRACE_GATEWAY_ECHO_OK"}],
+        stop_reason="end_turn",
+        stop_sequence=None,
+        usage=Usage(
+            input_tokens=estimate_trace_echo_tokens(original_request),
+            output_tokens=5,
+        ),
+    )
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -1073,6 +1120,10 @@ async def create_message(
     request: MessagesRequest,
     raw_request: Request
 ):
+    trace_id = new_trace_id("msg")
+    trace_start = time.time()
+    litellm_request = None
+    body_json: Dict[str, Any] = {}
     try:
         # print the body here
         body = await raw_request.body()
@@ -1080,6 +1131,16 @@ async def create_message(
         # Parse the raw body as JSON since it's bytes
         body_json = json.loads(body.decode('utf-8'))
         original_model = body_json.get("model", "unknown")
+        trace_request_started(
+            trace_id=trace_id,
+            api="messages",
+            method=raw_request.method,
+            path=raw_request.url.path,
+            headers=headers_to_trace(raw_request.headers.items()),
+            client=raw_request.client.host if raw_request.client else None,
+            body_json=body_json,
+            mapped_model=request.model,
+        )
         
         # Get the display name for logging, just the model name without provider prefix
         display_model = original_model
@@ -1187,6 +1248,29 @@ async def create_message(
                     logger.warning(f"Message {i} has None content - replacing with placeholder")
                     msg["content"] = "..."
         
+        if TRACE_ECHO_ONLY:
+            logger.warning("CC_TRACE_ECHO_ONLY enabled; returning deterministic trace echo response without upstream call")
+            num_tools = len(request.tools) if request.tools else 0
+            log_request_beautifully(
+                "POST",
+                raw_request.url.path,
+                display_model,
+                litellm_request.get('model'),
+                len(litellm_request['messages']),
+                num_tools,
+                200
+            )
+            anthropic_response = build_trace_echo_response(request)
+            trace_request_completed(
+                trace_id=trace_id,
+                status_code=200,
+                duration_ms=monotonic_ms(trace_start),
+                converted_request=litellm_request,
+                response=anthropic_response,
+                extra={"echo_only": True},
+            )
+            return anthropic_response
+        
         # Only log basic info about the request, not the full details
         logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
         
@@ -1240,6 +1324,15 @@ async def create_message(
 
         # Convert LiteLLM response to Anthropic format
         anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+
+        trace_request_completed(
+            trace_id=trace_id,
+            status_code=200,
+            duration_ms=monotonic_ms(trace_start),
+            converted_request=litellm_request,
+            response=anthropic_response,
+            extra={"upstream_response": model_to_plain(litellm_response)},
+        )
 
         return anthropic_response
                 
@@ -1296,6 +1389,13 @@ async def create_message(
         
         # Return detailed error
         status_code = error_details.get('status_code', 500)
+        trace_request_failed(
+            trace_id=trace_id,
+            status_code=status_code,
+            duration_ms=monotonic_ms(trace_start),
+            converted_request=litellm_request,
+            error=sanitized_details,
+        )
         raise HTTPException(status_code=status_code, detail=error_message)
 
 @app.post("/v1/messages/count_tokens")
@@ -1303,6 +1403,20 @@ async def count_tokens(
     request: TokenCountRequest,
     raw_request: Request
 ):
+    trace_id = new_trace_id("tok")
+    trace_start = time.time()
+    converted_request = None
+    request_body = model_to_plain(request)
+    trace_request_started(
+        trace_id=trace_id,
+        api="count_tokens",
+        method=raw_request.method,
+        path=raw_request.url.path,
+        headers=headers_to_trace(raw_request.headers.items()),
+        client=raw_request.client.host if raw_request.client else None,
+        body_json=request_body,
+        mapped_model=request.model,
+    )
     try:
         # Log the incoming token count request
         original_model = request.original_model or request.model
@@ -1362,22 +1476,113 @@ async def count_tokens(
             token_count = await asyncio.to_thread(token_counter, **token_counter_args)
             
             # Return Anthropic-style response
-            return TokenCountResponse(input_tokens=token_count)
+            response = TokenCountResponse(input_tokens=token_count)
+            trace_request_completed(
+                trace_id=trace_id,
+                status_code=200,
+                duration_ms=monotonic_ms(trace_start),
+                converted_request=converted_request,
+                response=response,
+            )
+            return response
             
         except ImportError:
             logger.error("Could not import token_counter from litellm")
             # Fallback to a simple approximation
-            return TokenCountResponse(input_tokens=1000)  # Default fallback
+            response = TokenCountResponse(input_tokens=1000)
+            trace_request_completed(
+                trace_id=trace_id,
+                status_code=200,
+                duration_ms=monotonic_ms(trace_start),
+                converted_request=converted_request,
+                response=response,
+                extra={"fallback": "missing_litellm_token_counter"},
+            )
+            return response  # Default fallback
             
     except Exception as e:
         import traceback
         error_traceback = traceback.format_exc()
         logger.error(f"Error counting tokens: {str(e)}\n{error_traceback}")
+        trace_request_failed(
+            trace_id=trace_id,
+            status_code=500,
+            duration_ms=monotonic_ms(trace_start),
+            converted_request=converted_request,
+            error={"error": str(e), "type": type(e).__name__, "traceback": error_traceback},
+        )
         raise HTTPException(status_code=500, detail=f"Error counting tokens: {str(e)}")
 
 @app.get("/")
 async def root():
-    return {"message": "Anthropic Proxy for LiteLLM"}
+    return {"message": "Anthropic Proxy for LiteLLM", "trace_ui": "/trace"}
+
+@app.get("/trace", include_in_schema=False)
+async def trace_ui():
+    return FileResponse(Path(__file__).parent / "static" / "trace.html")
+
+@app.get("/api/v2/stats")
+async def api_stats():
+    return snapshot_stats()
+
+@app.get("/api/v2/sessions")
+async def api_list_sessions():
+    return {"sessions": list_sessions(), "stats": snapshot_stats()}
+
+@app.get("/api/v2/sessions/{session_id}")
+async def api_get_session(session_id: str):
+    sess = get_session(session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return sess
+
+@app.get("/api/v2/sessions/{session_id}/timeline")
+async def api_session_timeline(session_id: str):
+    return {"session_id": session_id, "events": build_timeline(session_id)}
+
+@app.get("/api/v2/sessions/{session_id}/history")
+async def api_session_history(session_id: str):
+    return {"session_id": session_id, "roots": build_history_chains(session_id)}
+
+@app.get("/api/v2/sessions/{session_id}/agents")
+async def api_session_agents(session_id: str):
+    return {"session_id": session_id, "roots": build_agent_tree(session_id)}
+
+@app.get("/api/v2/requests")
+async def api_list_requests(session_id: Optional[str] = None,
+                            role_kind: Optional[str] = None,
+                            api: Optional[str] = None):
+    return {
+        "requests": list_requests(
+            {"session_id": session_id, "role_kind": role_kind, "api": api}
+        )
+    }
+
+@app.get("/api/v2/requests/{trace_id}")
+async def api_get_request(trace_id: str):
+    detail = get_request(trace_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Trace request not found")
+    return detail
+
+@app.get("/api/v2/tool_events/{event_id}")
+async def api_get_tool_event(event_id: str):
+    e = get_tool_event(event_id)
+    if e is None:
+        raise HTTPException(status_code=404, detail="Tool event not found")
+    return e
+
+@app.get("/api/v2/agent_calls/{agent_call_id}")
+async def api_get_agent_call(agent_call_id: str):
+    call = get_agent_call(agent_call_id)
+    if call is None:
+        raise HTTPException(status_code=404, detail="Agent call not found")
+    return call
+
+@app.delete("/api/v2/traces")
+async def api_clear_traces():
+    clear_traces()
+    return {"ok": True}
 
 # Define ANSI color codes for terminal output
 class Colors:

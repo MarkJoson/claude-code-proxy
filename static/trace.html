@@ -1,0 +1,1007 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Claude Code 轨迹分析</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #161c24;
+    --panel-2: #1d242d;
+    --line: #283038;
+    --line-2: #364150;
+    --text: #d9e2ec;
+    --text-dim: #8b97a4;
+    --text-faint: #5a6675;
+    --accent: #4ea8de;
+    --accent-2: #5eead4;
+    --warn: #f59e0b;
+    --error: #f87171;
+    --ok: #34d399;
+    --titler: #c4b5fd;
+    --main: #5eead4;
+    --subagent: #f59e0b;
+    --tool: #93c5fd;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  pre, code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  header .title { font-size: 14px; font-weight: 600; }
+  header .meta { color: var(--text-dim); font-size: 12px; }
+  header .grow { flex: 1; }
+  header .actions { display: flex; gap: 8px; align-items: center; }
+  header input[type="search"] {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--line-2);
+    border-radius: 4px;
+    padding: 5px 8px;
+    width: 260px;
+    font-size: 12px;
+  }
+  header button {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line-2);
+    border-radius: 4px;
+    padding: 5px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  header button:hover { border-color: var(--accent); }
+  header button.active { color: var(--accent); border-color: var(--accent); }
+
+  .stats {
+    display: flex; flex-wrap: wrap; gap: 12px;
+    padding: 8px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+  }
+  .stat { color: var(--text-dim); }
+  .stat strong { color: var(--text); margin-right: 4px; }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 320px 1fr 480px;
+    height: calc(100vh - 90px);
+  }
+  .pane { overflow: auto; border-right: 1px solid var(--line); }
+  .pane:last-child { border-right: 0; }
+  .pane-head {
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .pane-head strong { color: var(--text); }
+
+  /* Left: session list */
+  .session-item {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+  }
+  .session-item:hover { background: var(--panel); }
+  .session-item.active { background: var(--panel-2); border-left: 3px solid var(--accent); padding-left: 9px; }
+  .session-item .sid { font-family: ui-monospace, monospace; font-size: 11px; color: var(--text-dim); }
+  .session-item .stitle { font-size: 13px; margin: 4px 0; color: var(--text); }
+  .session-item .smeta { font-size: 11px; color: var(--text-faint); }
+
+  /* Middle: tabs */
+  .tabs {
+    display: flex; border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    position: sticky; top: 0; z-index: 9;
+  }
+  .tab {
+    padding: 8px 14px;
+    font-size: 12px;
+    color: var(--text-dim);
+    cursor: pointer;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    background: none;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .view { padding: 12px; }
+  .empty { color: var(--text-faint); font-style: italic; padding: 24px; text-align: center; }
+
+  /* Request list rows */
+  .req-row {
+    display: grid;
+    grid-template-columns: 24px 90px 70px 1fr 70px;
+    gap: 8px;
+    align-items: center;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .req-row:hover { background: var(--panel); }
+  .req-row.active { background: var(--panel-2); }
+  .req-row .ix { color: var(--text-faint); font-family: ui-monospace, monospace; text-align: right; }
+  .req-row .time { color: var(--text-dim); font-family: ui-monospace, monospace; font-size: 11px; }
+  .req-row .role-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .role-titler { background: rgba(196,181,253,0.18); color: var(--titler); }
+  .role-main { background: rgba(94,234,212,0.18); color: var(--main); }
+  .role-subagent { background: rgba(245,158,11,0.18); color: var(--subagent); }
+  .role-system { background: rgba(147,197,253,0.18); color: var(--tool); }
+  .req-row .summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .req-row .status { font-size: 11px; color: var(--text-dim); }
+  .status.success { color: var(--ok); }
+  .status.error { color: var(--error); }
+  .status.inflight { color: var(--warn); }
+
+  /* Tree (history / agent) */
+  .tree { padding: 4px; }
+  .node {
+    margin: 2px 0;
+    padding: 4px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .node:hover { background: var(--panel); }
+  .node.active { background: var(--panel-2); }
+  .node .toggle { width: 12px; color: var(--text-faint); cursor: pointer; user-select: none; }
+  .node .icon { width: 14px; text-align: center; }
+  .node .label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .node .badge {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--text-dim);
+    background: var(--bg);
+    border: 1px solid var(--line-2);
+  }
+  .node .arrow { color: var(--text-faint); font-size: 10px; }
+  .children { margin-left: 14px; border-left: 1px solid var(--line); padding-left: 8px; }
+  .agent-call-node { color: var(--accent-2); }
+
+  /* Timeline */
+  .tl-row {
+    display: grid;
+    grid-template-columns: 36px 60px 100px 100px 1fr;
+    gap: 8px;
+    padding: 4px 10px;
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+    font-size: 12px;
+    align-items: center;
+  }
+  .tl-row:hover { background: var(--panel); }
+  .tl-row.active { background: var(--panel-2); }
+  .tl-row .idx { color: var(--text-faint); font-family: ui-monospace, monospace; text-align: right; }
+  .tl-row .t { color: var(--text-dim); font-family: ui-monospace, monospace; font-size: 11px; }
+  .tl-row .kind {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    text-align: center;
+  }
+  .kind-llm_request_start { background: rgba(94,234,212,0.18); color: var(--main); }
+  .kind-llm_request_end { background: rgba(94,234,212,0.10); color: var(--main); }
+  .kind-tool_use_response { background: rgba(147,197,253,0.18); color: var(--tool); }
+  .kind-tool_result { background: rgba(147,197,253,0.10); color: var(--tool); }
+  .tl-row .agent { color: var(--text-faint); font-family: ui-monospace, monospace; font-size: 11px; }
+  .tl-row .summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Right pane: detail */
+  .detail-section {
+    border-bottom: 1px solid var(--line);
+  }
+  .detail-section h3 {
+    margin: 0;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+    background: var(--panel);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 500;
+  }
+  .detail-section .body { padding: 8px 12px; font-size: 12px; }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; }
+  .kv > div:nth-child(odd) { color: var(--text-dim); }
+  .kv code { font-size: 11px; word-break: break-all; }
+  pre.code {
+    margin: 0;
+    padding: 8px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    overflow: auto;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text);
+    max-height: 360px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .detail-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 0 12px;
+    background: var(--panel);
+  }
+  .detail-tab {
+    padding: 6px 10px;
+    font-size: 11px;
+    color: var(--text-dim);
+    cursor: pointer;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    background: none;
+  }
+  .detail-tab:hover { color: var(--text); }
+  .detail-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .msg-block {
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    margin: 6px 0;
+    overflow: hidden;
+  }
+  .msg-block .msg-head {
+    padding: 4px 8px;
+    background: var(--panel);
+    font-size: 11px;
+    color: var(--text-dim);
+    display: flex; gap: 8px; align-items: center;
+  }
+  .msg-block .msg-body { padding: 8px; font-size: 12px; }
+  .msg-block .msg-body pre { margin: 0; }
+  .role-user { border-left: 3px solid var(--accent); }
+  .role-assistant { border-left: 3px solid var(--main); }
+  .role-system { border-left: 3px solid var(--text-faint); }
+  .tool-block {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 6px 8px;
+    margin: 4px 0;
+    font-size: 11px;
+  }
+  .tool-block .tool-name {
+    color: var(--accent-2);
+    font-weight: 600;
+  }
+  .tool-block.result .tool-name { color: var(--tool); }
+
+  a.link {
+    color: var(--accent);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  a.link:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">Claude Code 轨迹分析</div>
+  <div class="meta" id="metaText">等待数据…</div>
+  <div class="grow"></div>
+  <div class="actions">
+    <input id="search" type="search" placeholder="过滤: trace_id / role / model / tool" />
+    <button id="autoRefresh" type="button">自动: 关</button>
+    <button id="refresh" type="button">刷新</button>
+    <button id="clear" type="button">清空</button>
+  </div>
+</header>
+<div class="stats" id="statsBar"></div>
+<div class="layout">
+  <!-- Left: sessions -->
+  <aside class="pane" id="sessionPane">
+    <div class="pane-head"><strong>会话</strong> <span id="sessionMeta"></span></div>
+    <div id="sessionList"></div>
+  </aside>
+  <!-- Middle: tabs + view -->
+  <main class="pane" id="mainPane">
+    <div class="tabs" id="tabs">
+      <button class="tab active" data-tab="requests">请求列表</button>
+      <button class="tab" data-tab="history">历史链</button>
+      <button class="tab" data-tab="agents">Agent 层级</button>
+      <button class="tab" data-tab="timeline">时间线</button>
+    </div>
+    <div class="view" id="mainView"></div>
+  </main>
+  <!-- Right: detail -->
+  <aside class="pane" id="detailPane">
+    <div class="pane-head"><strong>详情</strong> <span id="detailMeta">未选择</span></div>
+    <div id="detailView"><div class="empty">点击左侧或中间任一项目以查看详情。</div></div>
+  </aside>
+</div>
+
+<script>
+const state = {
+  sessions: [],
+  currentSession: null,
+  currentTab: 'requests',
+  // currently selected entity in the right pane: { kind, id, ... }
+  selection: null,
+  selectedDetailTab: 'overview',
+  filter: '',
+  autoRefresh: false,
+  refreshTimer: null,
+  cache: { requests: null, history: null, agents: null, timeline: null, requestDetails: {}, agentCallDetails: {}, toolEventDetails: {} }
+};
+
+const $ = (id) => document.getElementById(id);
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+function fmtTime(value) {
+  if (!value) return '-';
+  try {
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return value;
+    const hh = String(d.getHours()).padStart(2,'0');
+    const mm = String(d.getMinutes()).padStart(2,'0');
+    const ss = String(d.getSeconds()).padStart(2,'0');
+    const ms = String(d.getMilliseconds()).padStart(3,'0');
+    return `${hh}:${mm}:${ss}.${ms}`;
+  } catch (e) { return value; }
+}
+function fmtDate(value) {
+  if (!value) return '-';
+  try {
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return value;
+    return d.toLocaleString();
+  } catch (e) { return value; }
+}
+function shortId(id) {
+  if (!id) return '-';
+  const s = String(id);
+  if (s.length <= 14) return s;
+  return s.slice(0, 8) + '…' + s.slice(-4);
+}
+function jsonText(value) {
+  try { return JSON.stringify(value, null, 2); } catch (e) { return String(value); }
+}
+
+async function fetchJson(url, opts) {
+  const r = await fetch(url, { cache: 'no-store', ...(opts || {}) });
+  if (!r.ok) throw new Error(`${url} → ${r.status}`);
+  return r.json();
+}
+
+// -------------------------------------------------------------
+// Sessions
+// -------------------------------------------------------------
+async function loadSessions() {
+  const data = await fetchJson('/api/v2/sessions');
+  state.sessions = data.sessions || [];
+  renderStats(data.stats || {});
+  renderSessionList();
+  if (state.sessions.length) {
+    const stillThere = state.currentSession
+      && state.sessions.find((s) => s.session_id === state.currentSession);
+    if (!stillThere) {
+      await selectSession(state.sessions[0].session_id);
+    } else {
+      await refreshCurrentSession();
+    }
+  } else {
+    state.currentSession = null;
+    $('mainView').innerHTML = '<div class="empty">还没有任何 Claude Code 请求被记录。</div>';
+    $('detailView').innerHTML = '<div class="empty">未选择</div>';
+    $('detailMeta').textContent = '未选择';
+  }
+}
+
+function renderStats(stats) {
+  $('metaText').textContent =
+    `${stats.session_count || 0} sessions · ${stats.message_request_count || 0} LLM requests · ${stats.agent_call_count || 0} agent calls`;
+  const items = [
+    ['Sessions', stats.session_count || 0],
+    ['LLM 请求', stats.message_request_count || 0],
+    ['Main', stats.main_request_count || 0],
+    ['Subagent', stats.subagent_request_count || 0],
+    ['Titler', stats.titler_request_count || 0],
+    ['count_tokens', stats.count_tokens_request_count || 0],
+    ['Agent calls', stats.agent_call_count || 0],
+    ['历史链接', stats.history_link_count || 0],
+    ['Tool events', stats.tool_event_count || 0],
+  ];
+  $('statsBar').innerHTML = items.map(([k,v]) =>
+    `<div class="stat"><strong>${escapeHtml(v)}</strong>${escapeHtml(k)}</div>`
+  ).join('');
+}
+
+function renderSessionList() {
+  const list = state.sessions;
+  $('sessionMeta').textContent = `${list.length}`;
+  if (!list.length) {
+    $('sessionList').innerHTML = '<div class="empty">无会话</div>';
+    return;
+  }
+  $('sessionList').innerHTML = list.map((s) => {
+    const active = s.session_id === state.currentSession ? ' active' : '';
+    const title = s.title || `${s.main_requests || 0} main · ${s.subagent_requests || 0} subagent`;
+    return `<div class="session-item${active}" data-session-id="${escapeHtml(s.session_id)}">
+      <div class="sid">${escapeHtml(shortId(s.session_id))}</div>
+      <div class="stitle">${escapeHtml(title)}</div>
+      <div class="smeta">
+        ${escapeHtml(fmtDate(s.first_seen))} · cc ${escapeHtml(s.cc_version || '?')}<br/>
+        ${s.main_requests || 0}M · ${s.subagent_requests || 0}S · ${s.titler_requests || 0}T · ${s.token_requests || 0}tok
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function selectSession(session_id) {
+  state.currentSession = session_id;
+  state.selection = null;
+  state.cache = { requests: null, history: null, agents: null, timeline: null, requestDetails: {}, agentCallDetails: {}, toolEventDetails: {} };
+  renderSessionList();
+  await refreshCurrentSession();
+  $('detailView').innerHTML = '<div class="empty">点击中间面板任一项以查看详情。</div>';
+  $('detailMeta').textContent = '未选择';
+}
+
+async function refreshCurrentSession() {
+  if (!state.currentSession) return;
+  await loadCurrentTab(true);
+}
+
+// -------------------------------------------------------------
+// Middle: tabs
+// -------------------------------------------------------------
+function selectTab(tab) {
+  state.currentTab = tab;
+  document.querySelectorAll('.tab').forEach((el) =>
+    el.classList.toggle('active', el.dataset.tab === tab));
+  loadCurrentTab(false);
+}
+
+async function loadCurrentTab(refetch) {
+  if (!state.currentSession) return;
+  const sid = state.currentSession;
+  const cache = state.cache;
+  if (state.currentTab === 'requests') {
+    if (refetch || !cache.requests) {
+      cache.requests = await fetchJson(`/api/v2/requests?session_id=${encodeURIComponent(sid)}`);
+    }
+    renderRequestList(cache.requests.requests || []);
+  } else if (state.currentTab === 'history') {
+    if (refetch || !cache.history) {
+      cache.history = await fetchJson(`/api/v2/sessions/${encodeURIComponent(sid)}/history`);
+    }
+    renderHistoryTree(cache.history.roots || []);
+  } else if (state.currentTab === 'agents') {
+    if (refetch || !cache.agents) {
+      cache.agents = await fetchJson(`/api/v2/sessions/${encodeURIComponent(sid)}/agents`);
+    }
+    renderAgentTree(cache.agents.roots || []);
+  } else if (state.currentTab === 'timeline') {
+    if (refetch || !cache.timeline) {
+      cache.timeline = await fetchJson(`/api/v2/sessions/${encodeURIComponent(sid)}/timeline`);
+    }
+    renderTimeline(cache.timeline.events || []);
+  }
+}
+
+// -- Request list ---------------------------------------------
+function passesFilter(text) {
+  if (!state.filter) return true;
+  const f = state.filter.toLowerCase();
+  return String(text || '').toLowerCase().includes(f);
+}
+function reqHay(r) {
+  return [r.trace_id, r.role_kind, r.agent_label, r.model_requested, r.model_mapped,
+    r.title, r.api, r.parent_match_kind, (r.response_tool_names||[]).join(','),
+    r.response_stop_reason, r.cc_version].join(' ');
+}
+function roleBadge(role) {
+  return `<span class="role-badge role-${escapeHtml(role)}">${escapeHtml(role)}</span>`;
+}
+function statusClass(status) {
+  return status === 'success' ? 'success' : status === 'error' ? 'error' : 'inflight';
+}
+
+function renderRequestList(requests) {
+  const filtered = requests.filter((r) => passesFilter(reqHay(r)));
+  if (!filtered.length) {
+    $('mainView').innerHTML = '<div class="empty">没有匹配的请求。</div>';
+    return;
+  }
+  const rows = filtered.map((r, i) => {
+    const tools = (r.response_tool_names || []).join(', ') || '-';
+    const summary = r.title || `${r.api} · ${r.message_count} msgs · resp tools: ${tools}`;
+    const active = state.selection && state.selection.kind === 'request' && state.selection.id === r.trace_id ? ' active' : '';
+    return `<div class="req-row${active}" data-kind="request" data-id="${escapeHtml(r.trace_id)}">
+      <div class="ix">${i+1}</div>
+      <div class="time">${escapeHtml(fmtTime(r.started_at))}</div>
+      <div>${roleBadge(r.role_kind)}</div>
+      <div class="summary" title="${escapeHtml(r.trace_id)}">
+        ${escapeHtml(summary)}
+        <span style="color: var(--text-faint); font-size: 11px; margin-left: 6px;">${escapeHtml(shortId(r.trace_id))} · ${escapeHtml(r.model_mapped || r.model_requested || '?')}</span>
+      </div>
+      <div class="status ${statusClass(r.status)}">${escapeHtml(r.status)} ${r.duration_ms != null ? r.duration_ms + 'ms' : ''}</div>
+    </div>`;
+  });
+  $('mainView').innerHTML = `<div>${rows.join('')}</div>`;
+}
+
+// -- History tree ---------------------------------------------
+function renderHistoryTree(roots) {
+  if (!roots.length) {
+    $('mainView').innerHTML = '<div class="empty">没有历史链。</div>';
+    return;
+  }
+  $('mainView').innerHTML = `<div class="tree">${roots.map(historyNodeHtml).join('')}</div>`;
+}
+function historyNodeHtml(node) {
+  const active = state.selection && state.selection.kind === 'request' && state.selection.id === node.trace_id ? ' active' : '';
+  const matchTag = node.parent_match_kind
+    ? `<span class="badge">+${node.parent_added_steps} ${node.parent_match_kind}</span>`
+    : `<span class="badge">root</span>`;
+  const title = node.title || `${node.message_count} msgs · ${node.response_stop_reason || node.status}`;
+  const childHtml = (node.children || []).length
+    ? `<div class="children">${node.children.map(historyNodeHtml).join('')}</div>`
+    : '';
+  return `<div>
+    <div class="node${active}" data-kind="request" data-id="${escapeHtml(node.trace_id)}">
+      <span class="icon">${roleBadge(node.role_kind)}</span>
+      <span class="label">${escapeHtml(title)} <span style="color:var(--text-faint)">${escapeHtml(shortId(node.trace_id))}</span></span>
+      ${matchTag}
+      <span class="badge">${node.request_count} req</span>
+    </div>
+    ${childHtml}
+  </div>`;
+}
+
+// -- Agent tree -----------------------------------------------
+function renderAgentTree(roots) {
+  if (!roots.length) {
+    $('mainView').innerHTML = '<div class="empty">没有 Agent 活动。</div>';
+    return;
+  }
+  $('mainView').innerHTML = `<div class="tree">${roots.map(agentNodeHtml).join('')}</div>`;
+}
+function agentNodeHtml(node) {
+  if (node.kind === 'request') {
+    const active = state.selection && state.selection.kind === 'request' && state.selection.id === node.trace_id ? ' active' : '';
+    const title = node.title || `${node.message_count} msgs · ${node.stop_reason || node.status}`;
+    const childHtml = (node.children || []).length
+      ? `<div class="children">${node.children.map(agentNodeHtml).join('')}</div>`
+      : '';
+    return `<div>
+      <div class="node${active}" data-kind="request" data-id="${escapeHtml(node.trace_id)}">
+        <span class="icon">${roleBadge(node.role_kind)}</span>
+        <span class="label">${escapeHtml(title)} <span style="color:var(--text-faint)">${escapeHtml(shortId(node.trace_id))}</span></span>
+        <span class="badge">${escapeHtml(node.model_mapped || node.model_requested || '?')}</span>
+        ${node.duration_ms != null ? `<span class="badge">${node.duration_ms}ms</span>` : ''}
+      </div>
+      ${childHtml}
+    </div>`;
+  }
+  if (node.kind === 'agent_call') {
+    const active = state.selection && state.selection.kind === 'agent_call' && state.selection.id === node.agent_call_id ? ' active' : '';
+    const childHtml = (node.children || []).length
+      ? `<div class="children">${node.children.map(agentNodeHtml).join('')}</div>`
+      : '';
+    const status = node.status === 'completed' ? 'ok' : 'inflight';
+    return `<div>
+      <div class="node agent-call-node${active}" data-kind="agent_call" data-id="${escapeHtml(node.agent_call_id)}">
+        <span class="icon">⤷</span>
+        <span class="label">${escapeHtml(node.tool_name || 'Agent')} → ${escapeHtml(node.agent_label || '?')} · ${escapeHtml((node.input_preview||'').slice(0,80))}</span>
+        <span class="badge">${escapeHtml(node.status || '?')}</span>
+        ${node.duration_ms != null ? `<span class="badge">${node.duration_ms}ms</span>` : ''}
+      </div>
+      ${childHtml}
+    </div>`;
+  }
+  return '';
+}
+
+// -- Timeline -------------------------------------------------
+function renderTimeline(events) {
+  const filtered = events.filter((e) => passesFilter([
+    e.trace_id, e.kind, e.agent_label, e.tool_name, e.model_mapped, e.title, e.input_preview
+  ].join(' ')));
+  if (!filtered.length) {
+    $('mainView').innerHTML = '<div class="empty">没有时间线事件。</div>';
+    return;
+  }
+  $('mainView').innerHTML = filtered.map((e) => {
+    const active = state.selection
+      && ((state.selection.kind === 'request' && state.selection.id === e.trace_id && (e.kind === 'llm_request_start' || e.kind === 'llm_request_end'))
+       || (state.selection.kind === 'tool_event' && state.selection.id === e.event_id))
+      ? ' active' : '';
+    let summary = '';
+    let dataKind = 'request';
+    let dataId = e.trace_id;
+    if (e.kind === 'llm_request_start') {
+      summary = `LLM start · ${e.role_kind} · ${e.model_mapped || e.model_requested || ''} · ${e.message_count} msgs · ${e.title || ''}`;
+    } else if (e.kind === 'llm_request_end') {
+      summary = `LLM end · ${e.role_kind} · ${e.status || ''} · ${e.stop_reason || ''} · ${e.title || ''}`;
+    } else if (e.kind === 'tool_use_response') {
+      summary = `tool_use · ${e.tool_name || ''} · ${e.input_preview || ''}`;
+      dataKind = 'tool_event';
+      dataId = e.event_id;
+    } else if (e.kind === 'tool_result') {
+      summary = `tool_result · ${e.tool_name || ''} · ${e.input_preview || ''}`;
+      dataKind = 'tool_event';
+      dataId = e.event_id;
+    }
+    return `<div class="tl-row${active}" data-kind="${escapeHtml(dataKind)}" data-id="${escapeHtml(dataId)}">
+      <div class="idx">${e.index}</div>
+      <div class="t">${escapeHtml(fmtTime(e.event_time))}</div>
+      <div class="kind kind-${escapeHtml(e.kind)}">${escapeHtml(e.kind)}</div>
+      <div class="agent">${escapeHtml(e.agent_label || e.role_kind || '-')}</div>
+      <div class="summary" title="${escapeHtml(e.trace_id)}">${escapeHtml(summary)}
+        <span style="color:var(--text-faint);font-size:11px;margin-left:6px;">${escapeHtml(shortId(e.trace_id))}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// -------------------------------------------------------------
+// Right detail
+// -------------------------------------------------------------
+async function selectEntity(kind, id) {
+  if (!id) return;
+  state.selection = { kind, id };
+  // re-render the middle to show selected highlight
+  await loadCurrentTab(false);
+
+  if (kind === 'request') {
+    if (!state.cache.requestDetails[id]) {
+      state.cache.requestDetails[id] = await fetchJson(`/api/v2/requests/${encodeURIComponent(id)}`);
+    }
+    renderRequestDetail(state.cache.requestDetails[id]);
+  } else if (kind === 'agent_call') {
+    if (!state.cache.agentCallDetails[id]) {
+      state.cache.agentCallDetails[id] = await fetchJson(`/api/v2/agent_calls/${encodeURIComponent(id)}`);
+    }
+    renderAgentCallDetail(state.cache.agentCallDetails[id]);
+  } else if (kind === 'tool_event') {
+    if (!state.cache.toolEventDetails[id]) {
+      state.cache.toolEventDetails[id] = await fetchJson(`/api/v2/tool_events/${encodeURIComponent(id)}`);
+    }
+    renderToolEventDetail(state.cache.toolEventDetails[id]);
+  }
+}
+
+function renderRequestDetail(d) {
+  $('detailMeta').textContent = `request · ${shortId(d.trace_id)}`;
+  const tab = state.selectedDetailTab;
+  const tabs = [
+    ['overview', '概览'],
+    ['messages', '消息序列'],
+    ['response', '响应'],
+    ['tools', '工具事件'],
+    ['system', 'System'],
+    ['raw', '原始 JSON'],
+  ];
+  let body = '';
+  if (tab === 'overview') {
+    body = renderRequestOverview(d);
+  } else if (tab === 'messages') {
+    body = renderRequestMessages(d);
+  } else if (tab === 'response') {
+    body = renderRequestResponse(d);
+  } else if (tab === 'tools') {
+    body = renderRequestTools(d);
+  } else if (tab === 'system') {
+    body = renderRequestSystem(d);
+  } else if (tab === 'raw') {
+    body = renderRequestRaw(d);
+  }
+  $('detailView').innerHTML = `
+    <div class="detail-tabs">
+      ${tabs.map(([id,label]) => `<button class="detail-tab${tab===id?' active':''}" data-detail-tab="${id}">${label}</button>`).join('')}
+    </div>
+    ${body}
+  `;
+}
+
+function renderRequestOverview(d) {
+  const parentLink = d.parent
+    ? `<a class="link" data-jump-kind="request" data-jump-id="${escapeHtml(d.parent.trace_id)}">${escapeHtml(shortId(d.parent.trace_id))} (${escapeHtml(d.parent.role_kind)})</a> <span style="color:var(--text-faint)">${escapeHtml(d.parent_match_kind || '')} +${d.parent_added_steps || 0}</span>`
+    : '<span style="color:var(--text-faint)">root</span>';
+  const parentCallLink = d.parent_agent_call
+    ? `<a class="link" data-jump-kind="agent_call" data-jump-id="${escapeHtml(d.parent_agent_call.agent_call_id)}">${escapeHtml(d.parent_agent_call.agent_label || 'Agent')} call</a>`
+    : '<span style="color:var(--text-faint)">-</span>';
+  const childLinks = (d.children || []).map((c) =>
+    `<a class="link" data-jump-kind="request" data-jump-id="${escapeHtml(c.trace_id)}">${escapeHtml(shortId(c.trace_id))}</a>`
+  ).join(', ') || '<span style="color:var(--text-faint)">无</span>';
+  const launchedLinks = (d.launched_agent_calls || []).map((a) =>
+    `<a class="link" data-jump-kind="agent_call" data-jump-id="${escapeHtml(a.agent_call_id)}">${escapeHtml(a.agent_label || a.tool_name)}</a>`
+  ).join(', ') || '<span style="color:var(--text-faint)">无</span>';
+  const usage = d.response_usage || {};
+  return `<div class="detail-section"><h3>请求</h3><div class="body">
+    <div class="kv">
+      <div>Trace ID</div><div><code>${escapeHtml(d.trace_id)}</code></div>
+      <div>Session</div><div><code>${escapeHtml(d.session_id || '-')}</code></div>
+      <div>API</div><div>${escapeHtml(d.api)}</div>
+      <div>Role kind</div><div>${roleBadge(d.role_kind)} · ${escapeHtml(d.agent_label)}</div>
+      <div>Status</div><div class="status ${statusClass(d.status)}">${escapeHtml(d.status)} ${d.status_code || ''}</div>
+      <div>Started</div><div>${escapeHtml(fmtDate(d.started_at))}</div>
+      <div>Duration</div><div>${d.duration_ms != null ? d.duration_ms + ' ms' : '-'}</div>
+      <div>Model</div><div>${escapeHtml(d.model_requested || '?')} → ${escapeHtml(d.model_mapped || '?')}</div>
+      <div>Stop reason</div><div>${escapeHtml(d.response_stop_reason || '-')}</div>
+      <div>Title</div><div>${escapeHtml(d.title || '-')}</div>
+      <div>Messages</div><div>${escapeHtml(d.message_count)} msgs · ${escapeHtml(d.tool_count)} tools advertised · prefix depth ${(d.prefix_hashes || []).length}</div>
+      <div>System hash</div><div><code>${escapeHtml(d.system_hash || '-')}</code> (${escapeHtml(d.system_chars || 0)} chars)</div>
+      <div>Tools advertised</div><div>${escapeHtml((d.tool_names || []).join(', ') || '-')}</div>
+      <div>CC version</div><div>${escapeHtml(d.cc_version || '-')} · cch ${escapeHtml(d.cch || '-')}</div>
+      <div>Parent request</div><div>${parentLink}</div>
+      <div>Parent agent call</div><div>${parentCallLink}</div>
+      <div>Children requests</div><div>${childLinks}</div>
+      <div>Launched agent calls</div><div>${launchedLinks}</div>
+      <div>Usage</div><div><code>${escapeHtml(jsonText(usage))}</code></div>
+    </div>
+  </div></div>`;
+}
+
+function renderRequestMessages(d) {
+  const msgs = d.messages || [];
+  if (!msgs.length) return '<div class="empty">没有消息。</div>';
+  const parts = msgs.map((m) => {
+    const blocks = renderContentBlocks(m.full_content);
+    return `<div class="msg-block role-${escapeHtml(m.role)}">
+      <div class="msg-head">
+        <span>#${escapeHtml(m.msg_index >= 0 ? m.msg_index : 'sys')}</span>
+        <span>${escapeHtml(m.role)}</span>
+        <span style="color:var(--text-faint)">${escapeHtml(m.chars || 0)} chars · ${escapeHtml((m.block_types || []).join(','))}</span>
+        <span style="color:var(--text-faint); font-family: ui-monospace,monospace;">${escapeHtml(m.canonical_hash)}</span>
+      </div>
+      <div class="msg-body">${blocks}</div>
+    </div>`;
+  }).join('');
+  return `<div class="detail-section"><h3>消息序列</h3><div class="body">${parts}</div></div>`;
+}
+
+function renderContentBlocks(content) {
+  if (content == null) return '<span style="color:var(--text-faint)">empty</span>';
+  if (typeof content === 'string') {
+    return `<pre class="code">${escapeHtml(content)}</pre>`;
+  }
+  if (Array.isArray(content)) {
+    return content.map((b) => renderContentBlock(b)).join('');
+  }
+  return `<pre class="code">${escapeHtml(jsonText(content))}</pre>`;
+}
+
+function renderContentBlock(block) {
+  if (!block || typeof block !== 'object') {
+    return `<pre class="code">${escapeHtml(String(block))}</pre>`;
+  }
+  if (block.type === 'text') {
+    return `<pre class="code">${escapeHtml(block.text || '')}</pre>`;
+  }
+  if (block.type === 'tool_use') {
+    return `<div class="tool-block">
+      <div><span class="tool-name">tool_use</span> ${escapeHtml(block.name)} <span style="color:var(--text-faint)">${escapeHtml(block.id)}</span></div>
+      <pre class="code">${escapeHtml(jsonText(block.input))}</pre>
+    </div>`;
+  }
+  if (block.type === 'tool_result') {
+    const inner = renderContentBlocks(block.content);
+    return `<div class="tool-block result">
+      <div><span class="tool-name">tool_result</span> for <code>${escapeHtml(block.tool_use_id)}</code></div>
+      ${inner}
+    </div>`;
+  }
+  if (block.type === 'image') {
+    return `<div class="tool-block"><span class="tool-name">image</span> ${escapeHtml(jsonText(block.source||{}))}</div>`;
+  }
+  return `<pre class="code">${escapeHtml(jsonText(block))}</pre>`;
+}
+
+function renderRequestResponse(d) {
+  const r = d.response_body;
+  if (!r) return '<div class="empty">没有响应（请求失败或仍在进行）。</div>';
+  const text = (r.content || []).filter((b) => b && b.type === 'text').map((b) => b.text).join('\n');
+  const toolUses = (r.content || []).filter((b) => b && b.type === 'tool_use');
+  const sec = [];
+  if (text) sec.push(`<div class="detail-section"><h3>文本</h3><div class="body"><pre class="code">${escapeHtml(text)}</pre></div></div>`);
+  if (toolUses.length) {
+    sec.push(`<div class="detail-section"><h3>工具调用 (${toolUses.length})</h3><div class="body">${
+      toolUses.map((b) => `<div class="tool-block">
+        <div><span class="tool-name">${escapeHtml(b.name)}</span> <span style="color:var(--text-faint)">${escapeHtml(b.id)}</span></div>
+        <pre class="code">${escapeHtml(jsonText(b.input))}</pre>
+      </div>`).join('')
+    }</div></div>`);
+  }
+  sec.push(`<div class="detail-section"><h3>元数据</h3><div class="body"><div class="kv">
+    <div>id</div><div><code>${escapeHtml(r.id || '-')}</code></div>
+    <div>model</div><div>${escapeHtml(r.model || '-')}</div>
+    <div>stop_reason</div><div>${escapeHtml(r.stop_reason || '-')}</div>
+    <div>usage</div><div><code>${escapeHtml(jsonText(r.usage))}</code></div>
+  </div></div></div>`);
+  return sec.join('');
+}
+
+function renderRequestTools(d) {
+  const events = d.tool_events || [];
+  if (!events.length) return '<div class="empty">这个请求没有工具事件。</div>';
+  return `<div class="detail-section"><h3>工具事件 (${events.length})</h3><div class="body">${
+    events.map((e) => `<div class="tool-block ${e.event_type === 'tool_result' ? 'result' : ''}" data-jump-kind="tool_event" data-jump-id="${escapeHtml(e.event_id)}" style="cursor:pointer;">
+      <div>
+        <span class="tool-name">${escapeHtml(e.event_type)}</span>
+        ${escapeHtml(e.tool_name || '')}
+        <span style="color:var(--text-faint)">${escapeHtml(e.location)} · agent=${escapeHtml(e.agent_label || 'main')}</span>
+        <span style="color:var(--text-faint); font-family:ui-monospace,monospace;">${escapeHtml(shortId(e.tool_use_id || e.tool_result_id || ''))}</span>
+      </div>
+      <pre class="code">${escapeHtml(e.input_preview || '')}</pre>
+    </div>`).join('')
+  }</div></div>`;
+}
+
+function renderRequestSystem(d) {
+  if (!d.system_text) return '<div class="empty">没有 system 内容。</div>';
+  return `<div class="detail-section"><h3>System</h3><div class="body">
+    <div class="kv">
+      <div>chars</div><div>${d.system_chars}</div>
+      <div>hash</div><div><code>${escapeHtml(d.system_hash || '-')}</code></div>
+    </div>
+    <pre class="code">${escapeHtml(d.system_text)}</pre>
+  </div></div>`;
+}
+
+function renderRequestRaw(d) {
+  const blocks = [
+    ['Request body (Anthropic-style, post-sanitize)', d.request_body],
+    ['Converted request (LiteLLM-style sent upstream)', d.converted_request],
+    ['Response body (Anthropic-style)', d.response_body],
+    ['Headers', d.headers],
+    ['Error', d.error],
+    ['Extra', d.extra],
+  ];
+  return blocks.filter(([_, v]) => v).map(([label, v]) =>
+    `<div class="detail-section"><h3>${escapeHtml(label)}</h3><div class="body"><pre class="code">${escapeHtml(jsonText(v))}</pre></div></div>`
+  ).join('') || '<div class="empty">无原始数据。</div>';
+}
+
+function renderAgentCallDetail(d) {
+  $('detailMeta').textContent = `agent_call · ${shortId(d.agent_call_id)}`;
+  const childLinks = (d.child_requests || []).map((c) =>
+    `<a class="link" data-jump-kind="request" data-jump-id="${escapeHtml(c.trace_id)}">${escapeHtml(shortId(c.trace_id))} (${escapeHtml(c.role_kind)} · ${escapeHtml(c.title || c.status)})</a>`
+  ).join('<br>') || '<span style="color:var(--text-faint)">无</span>';
+  const parentLink = d.parent_request
+    ? `<a class="link" data-jump-kind="request" data-jump-id="${escapeHtml(d.parent_request.trace_id)}">${escapeHtml(shortId(d.parent_request.trace_id))} (${escapeHtml(d.parent_request.role_kind)})</a>`
+    : '<span style="color:var(--text-faint)">-</span>';
+  $('detailView').innerHTML = `
+    <div class="detail-section"><h3>Agent 调用</h3><div class="body">
+      <div class="kv">
+        <div>Call ID</div><div><code>${escapeHtml(d.agent_call_id)}</code></div>
+        <div>Tool name</div><div>${escapeHtml(d.tool_name || 'Agent')}</div>
+        <div>Subagent</div><div>${escapeHtml(d.agent_label || '-')}</div>
+        <div>Status</div><div class="status ${d.status === 'completed' ? 'success' : 'inflight'}">${escapeHtml(d.status || '-')}</div>
+        <div>Started</div><div>${escapeHtml(fmtDate(d.started_at))}</div>
+        <div>Completed</div><div>${escapeHtml(d.completed_at ? fmtDate(d.completed_at) : '-')}</div>
+        <div>Duration</div><div>${d.duration_ms != null ? d.duration_ms + ' ms' : '-'}</div>
+        <div>tool_use_id</div><div><code>${escapeHtml(d.tool_use_id || '-')}</code></div>
+        <div>Parent request</div><div>${parentLink}</div>
+        <div>Child requests</div><div>${childLinks}</div>
+      </div>
+    </div></div>
+    <div class="detail-section"><h3>Input (parent → subagent)</h3><div class="body"><pre class="code">${escapeHtml(d.input_preview || '')}</pre></div></div>
+    <div class="detail-section"><h3>Result (subagent → parent)</h3><div class="body"><pre class="code">${escapeHtml(d.result_preview || '(open / no result yet)')}</pre></div></div>
+  `;
+}
+
+function renderToolEventDetail(e) {
+  $('detailMeta').textContent = `tool_event · ${e.tool_name || e.event_type}`;
+  const partner = e.partner;
+  const partnerLink = partner
+    ? `<a class="link" data-jump-kind="tool_event" data-jump-id="${escapeHtml(partner.event_id)}">${escapeHtml(partner.event_type)} @ ${escapeHtml(fmtTime(partner.event_time))}</a>`
+    : '<span style="color:var(--text-faint)">未匹配</span>';
+  const reqLink = `<a class="link" data-jump-kind="request" data-jump-id="${escapeHtml(e.trace_id)}">${escapeHtml(shortId(e.trace_id))}</a>`;
+  $('detailView').innerHTML = `
+    <div class="detail-section"><h3>工具事件</h3><div class="body">
+      <div class="kv">
+        <div>Event type</div><div>${escapeHtml(e.event_type)}</div>
+        <div>Location</div><div>${escapeHtml(e.location)}</div>
+        <div>Tool</div><div>${escapeHtml(e.tool_name || '-')} · agent=${escapeHtml(e.agent_label || 'main')}</div>
+        <div>Tool use ID</div><div><code>${escapeHtml(e.tool_use_id || '-')}</code></div>
+        <div>Tool result ID</div><div><code>${escapeHtml(e.tool_result_id || '-')}</code></div>
+        <div>Time</div><div>${escapeHtml(fmtDate(e.event_time))}</div>
+        <div>In request</div><div>${reqLink}</div>
+        <div>Pair</div><div>${partnerLink}</div>
+      </div>
+    </div></div>
+    <div class="detail-section"><h3>Block</h3><div class="body"><pre class="code">${escapeHtml(jsonText(e.raw_block))}</pre></div></div>
+  `;
+}
+
+// -------------------------------------------------------------
+// Events
+// -------------------------------------------------------------
+document.addEventListener('click', async (event) => {
+  const sess = event.target.closest('[data-session-id]');
+  if (sess) {
+    await selectSession(sess.dataset.sessionId);
+    return;
+  }
+  const tab = event.target.closest('.tab');
+  if (tab) {
+    selectTab(tab.dataset.tab);
+    return;
+  }
+  const detailTab = event.target.closest('[data-detail-tab]');
+  if (detailTab) {
+    state.selectedDetailTab = detailTab.dataset.detailTab;
+    if (state.selection && state.selection.kind === 'request') {
+      renderRequestDetail(state.cache.requestDetails[state.selection.id]);
+    }
+    return;
+  }
+  const jumper = event.target.closest('[data-jump-kind]');
+  if (jumper) {
+    state.selectedDetailTab = 'overview';
+    selectEntity(jumper.dataset.jumpKind, jumper.dataset.jumpId);
+    return;
+  }
+  const item = event.target.closest('[data-kind][data-id]');
+  if (item) {
+    state.selectedDetailTab = 'overview';
+    selectEntity(item.dataset.kind, item.dataset.id);
+    return;
+  }
+});
+
+$('search').addEventListener('input', (event) => {
+  state.filter = event.target.value;
+  loadCurrentTab(false);
+});
+
+$('refresh').addEventListener('click', () => loadSessions());
+$('clear').addEventListener('click', async () => {
+  if (!confirm('清空全部 trace 记录？')) return;
+  await fetch('/api/v2/traces', { method: 'DELETE' });
+  await loadSessions();
+});
+$('autoRefresh').addEventListener('click', () => {
+  state.autoRefresh = !state.autoRefresh;
+  $('autoRefresh').textContent = state.autoRefresh ? '自动: 开' : '自动: 关';
+  $('autoRefresh').classList.toggle('active', state.autoRefresh);
+  if (state.refreshTimer) {
+    clearInterval(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+  if (state.autoRefresh) {
+    state.refreshTimer = setInterval(() => loadSessions().catch(console.error), 5000);
+  }
+});
+
+loadSessions().catch((err) => {
+  console.error(err);
+  $('mainView').innerHTML = `<div class="empty">加载失败: ${escapeHtml(err.message)}</div>`;
+});
+</script>
+</body>
+</html>

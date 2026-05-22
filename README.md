@@ -97,7 +97,76 @@ docker run -d --env-file .env -p 8082:8082 ghcr.io/1rgs/claude-code-proxy:latest
    ANTHROPIC_BASE_URL=http://localhost:8082 claude
    ```
 
-3. **That's it!** Your Claude Code client will now use the configured backend models (defaulting to Gemini) through the proxy. 🎯
+   For trace analysis, prefer the launcher script because it starts the gateway if needed and uses `--setting-sources local` so user/global Claude settings do not override the local gateway:
+
+   ```bash
+   scripts/claude_trace_ui.sh --clear-trace
+   ```
+
+   For Qwen/OpenAI-compatible backends, configure the upstream endpoint and mapped models before launching:
+
+   ```bash
+   OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 \
+   OPENAI_API_KEY=sk-... \
+   CC_TRACE_BIG_MODEL=qwen-plus \
+   CC_TRACE_SMALL_MODEL=qwen-turbo \
+   scripts/claude_trace_ui.sh --clear-trace
+   ```
+
+3. **That's it!** Your Claude Code client will now use the configured backend models through the proxy. 🎯
+
+### Trace Gateway UI
+
+This branch records every `/v1/messages` (and `/v1/messages/count_tokens`) call into a SQLite database (`cc_traces/trace.db`) and serves a per-session analysis UI from the same FastAPI app. After starting the proxy and pointing Claude Code at it, open:
+
+```bash
+http://localhost:8082/trace
+```
+
+Useful trace settings:
+
+- `CC_TRACE_ENABLED=false` disables recording.
+- `CC_TRACE_DIR=cc_traces` changes where `trace.db` is stored.
+- `CC_TRACE_INCLUDE_SYSTEM_IN_PREFIX=true` includes system prompts as the first prefix-hash step. By default, only conversation messages form the prefix.
+
+The UI is organised around the Claude Code session (`x-claude-code-session-id`). The left column lists sessions; the middle has four tabs and the right shows the detail of whatever you click:
+
+- **请求列表 (Requests)** – every `/v1/messages` call in the session, with role badge (`titler` / `main` / `subagent` / `external`), advertised tools, message count, mapped model, status and timing.
+- **历史链 (History chain)** – parent/child links discovered from the `prefix_hashes` of conversation history. Strict-prefix is preferred, and small tail-drift fallbacks (1–2 messages of async tool noise) are also linked.
+- **Agent 层级 (Agent hierarchy)** – pairs each main turn's `Agent`/`Task` `tool_use` with the subsequent `tool_result`, then attaches the subagent's `/v1/messages` calls under that `agent_call`; continuation main turns chain back via `parent_trace_id`.
+- **时间线 (Timeline)** – LLM request starts, LLM responses, response-side `tool_use` and observed `tool_result` events, ordered by timestamp.
+
+Clicking any row or node opens the matching detail on the right. Requests have sub-tabs (概览 / 消息序列 / 响应 / 工具事件 / System / 原始 JSON). Tool events show their input preview and link to their partner (paired `tool_use`/`tool_result`). Agent calls show the request that launched them and every child subagent request.
+
+The HTTP API (`/api/v2`) is documented by the routes themselves:
+
+- `GET /api/v2/stats` – snapshot counts.
+- `GET /api/v2/sessions` – session listing + stats.
+- `GET /api/v2/sessions/{session_id}` – session header + member requests + agent calls.
+- `GET /api/v2/sessions/{session_id}/timeline` – timeline events.
+- `GET /api/v2/sessions/{session_id}/history` – history-chain forest.
+- `GET /api/v2/sessions/{session_id}/agents` – agent hierarchy forest.
+- `GET /api/v2/requests?session_id=&role_kind=&api=` – flat request listing.
+- `GET /api/v2/requests/{trace_id}` – full request detail (raw body, converted LiteLLM body, response, messages, tool events, parent/children).
+- `GET /api/v2/tool_events/{event_id}` – single tool event detail (with paired partner).
+- `GET /api/v2/agent_calls/{agent_call_id}` – Agent/Task call detail.
+- `DELETE /api/v2/traces` – truncate the database.
+
+To clear the current trace file before a run, click **清空** in the UI or call:
+
+```bash
+curl -X DELETE http://127.0.0.1:8082/api/v2/traces
+```
+
+With the proxy already running, run the Claude Agent SDK client test with:
+
+```bash
+uv run --dev python test_claude_sdk_trace.py --base-url http://127.0.0.1:8082
+uv run --dev python test_claude_sdk_trace.py --base-url http://127.0.0.1:8082 --scenario tool-project --max-tokens 512
+uv run --dev python test_claude_sdk_trace.py --base-url http://127.0.0.1:8082 --scenario multi-task --turns 3 --max-tokens 96
+```
+
+These tests do not send `x-claude-code-session-id`, so they are bucketed under a derived `ext-<client>-<ua>-<date>` session row instead of being dropped.
 
 ## Model Mapping 🗺️
 
