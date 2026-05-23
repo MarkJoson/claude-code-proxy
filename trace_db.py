@@ -1495,6 +1495,232 @@ def build_history_chains(session_id: Optional[str] = None) -> List[Dict[str, Any
     return roots
 
 
+def build_time_trajectory(session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Group timeline events into classified time-segments (bursts).
+
+    Algorithm:
+      1. Pull events via build_timeline (sorted by event_time_ms).
+      2. Compute inter-event gaps; split into bursts wherever
+         gap > max(2000ms, 5 × median_gap).
+      3. Classify each burst by role + activity composition.
+
+    Output:
+      {
+        "events":   [<event_obj>, ...],
+        "segments": [{
+            "id", "start_ms", "end_ms", "duration_ms",
+            "classification",   # canonical key
+            "label",            # human-readable
+            "event_start_index","event_end_index","event_count",
+            "stats": { llm_starts, llm_ends, tool_uses, tool_results, unique_agents }
+        }, ...]
+      }
+    """
+    events = build_timeline(session_id)
+    if not events:
+        return {"events": [], "segments": []}
+
+    times = [e.get("event_time_ms") or 0 for e in events]
+
+    # Gap-based segmentation
+    if len(events) == 1:
+        breakpoints = [0, 1]
+    else:
+        gaps = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+        sorted_gaps = sorted(gaps)
+        median_gap = sorted_gaps[len(sorted_gaps) // 2] if sorted_gaps else 0
+        threshold = max(2000, median_gap * 5)
+        breakpoints = [0]
+        for i, g in enumerate(gaps):
+            if g > threshold:
+                breakpoints.append(i + 1)
+        breakpoints.append(len(events))
+
+    segments: List[Dict[str, Any]] = []
+    for idx, (start, end) in enumerate(zip(breakpoints[:-1], breakpoints[1:])):
+        seg = _classify_burst(events, start, end)
+        seg["id"] = f"seg-{idx}"
+        segments.append(seg)
+
+    return {"events": events, "segments": segments}
+
+
+def _classify_burst(events: List[Dict[str, Any]], start_idx: int, end_idx: int) -> Dict[str, Any]:
+    sub = events[start_idx:end_idx]
+    n_llm_start = sum(1 for e in sub if e.get("kind") == "llm_request_start")
+    n_llm_end = sum(1 for e in sub if e.get("kind") == "llm_request_end")
+    n_tool_use = sum(1 for e in sub if e.get("kind") == "tool_use_response")
+    n_tool_result = sum(1 for e in sub if e.get("kind") == "tool_result")
+
+    role_kinds: set = set()
+    agent_labels: set = set()
+    for e in sub:
+        r = e.get("role_kind")
+        if r:
+            role_kinds.add(r)
+        else:
+            # tool events use agent_label as proxy
+            label = e.get("agent_label") or "main"
+            role_kinds.add("main" if label == "main" else "subagent")
+        l = e.get("agent_label")
+        if l and l not in ("main", "titler"):
+            agent_labels.add(l)
+
+    start_ms = sub[0].get("event_time_ms") or 0
+    end_ms = sub[-1].get("event_time_ms") or 0
+
+    has_main = "main" in role_kinds
+    has_subagent = "subagent" in role_kinds
+    has_titler = "titler" in role_kinds
+    has_tools = n_tool_use > 0
+
+    sorted_labels = sorted(agent_labels)
+
+    if has_titler and not has_main and not has_subagent:
+        classification = "titler"
+        label = f"Titler · {n_llm_start} call"
+    elif has_subagent and has_main:
+        labels_str = ", ".join(sorted_labels[:2]) if sorted_labels else "subagents"
+        classification = "agent_dispatch"
+        label = f"Agent dispatch · {labels_str}" + ("…" if len(sorted_labels) > 2 else "")
+    elif has_subagent and not has_main:
+        labels_str = ", ".join(sorted_labels[:2]) if sorted_labels else "subagent"
+        classification = "subagent"
+        label = f"Subagent · {labels_str}" + ("…" if len(sorted_labels) > 2 else "")
+    elif has_main and has_tools:
+        classification = "main_tools"
+        plural = "s" if n_tool_use != 1 else ""
+        label = f"Main + tools · {n_tool_use} tool{plural}"
+    elif has_main:
+        classification = "main_thinking"
+        plural = "s" if n_llm_start != 1 else ""
+        label = f"Main thinking · {n_llm_start} call{plural}"
+    else:
+        classification = "misc"
+        label = f"{len(sub)} events"
+
+    return {
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "duration_ms": end_ms - start_ms,
+        "classification": classification,
+        "label": label,
+        "event_start_index": start_idx,
+        "event_end_index": end_idx,
+        "event_count": len(sub),
+        "stats": {
+            "llm_starts": n_llm_start,
+            "llm_ends": n_llm_end,
+            "tool_uses": n_tool_use,
+            "tool_results": n_tool_result,
+            "unique_agents": sorted_labels,
+        },
+    }
+
+
+def build_prefix_trie(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Build a compressed trie of all requests' prefix_hashes.
+
+    Each output node represents either a branching point or a terminal where
+    one (or more) requests end. Chains with a single child and no terminals
+    are compressed into the next node's `step_count`.
+
+    Node shape:
+      {
+        "node_id":          stable id ("branch:<hash>" or "req:<trace_id>"),
+        "step_count":       int,    # how many message-steps this edge spans
+        "first_step_hash":  str | None,
+        "last_step_hash":   str | None,
+        "terminal_requests": [ {trace_id, role_kind, ...}, ... ],
+        "children":         [ <node>, ... ]
+      }
+    """
+    c = _conn()
+    where = "WHERE session_id = ?" if session_id else ""
+    params = (session_id,) if session_id else ()
+    rows = c.execute(
+        f"""
+        SELECT trace_id, role_kind, agent_label, model_mapped, model_requested,
+               title, message_count, prefix_hashes_json, started_ms, status,
+               response_stop_reason, duration_ms
+        FROM requests
+        {where}
+        ORDER BY started_ms ASC
+        """,
+        params,
+    ).fetchall()
+
+    # Raw trie: each node is { 'children': {hash: child_node}, 'requests': [...], 'step': hash }
+    raw_root: Dict[str, Any] = {"children": {}, "requests": []}
+
+    for r in rows:
+        hashes_json = r["prefix_hashes_json"]
+        if not hashes_json:
+            continue
+        try:
+            hashes = json.loads(hashes_json)
+        except Exception:
+            continue
+        if not hashes:
+            continue
+        req_summary = {
+            "trace_id": r["trace_id"],
+            "role_kind": r["role_kind"],
+            "agent_label": r["agent_label"],
+            "model_mapped": r["model_mapped"],
+            "model_requested": r["model_requested"],
+            "title": r["title"],
+            "message_count": r["message_count"],
+            "status": r["status"],
+            "response_stop_reason": r["response_stop_reason"],
+            "started_ms": r["started_ms"],
+            "duration_ms": r["duration_ms"],
+            "depth": len(hashes),
+        }
+        cur = raw_root
+        for h in hashes:
+            child = cur["children"].get(h)
+            if child is None:
+                child = {"children": {}, "requests": [], "step": h}
+                cur["children"][h] = child
+            cur = child
+        cur["requests"].append(req_summary)
+
+    # Compress chains during serialization.
+    # edge_steps = list of hashes from the previous branching point down to (and including) this node.
+    def _build(node: Dict[str, Any], edge_steps: List[str]) -> Dict[str, Any]:
+        # Compress: if exactly one child and no terminal requests, keep going.
+        while len(node["children"]) == 1 and not node["requests"]:
+            ((h, child),) = node["children"].items()
+            edge_steps.append(h)
+            node = child
+        terminals = node["requests"]
+        children_items = list(node["children"].items())
+        # Stable node_id: terminal → first req's trace_id; otherwise the last hash on this edge.
+        if terminals:
+            node_id = f"req:{terminals[0]['trace_id']}"
+        elif edge_steps:
+            node_id = f"branch:{edge_steps[-1]}"
+        else:
+            node_id = "branch:root"
+        out = {
+            "node_id": node_id,
+            "step_count": len(edge_steps),
+            "first_step_hash": edge_steps[0] if edge_steps else None,
+            "last_step_hash": edge_steps[-1] if edge_steps else None,
+            "terminal_requests": terminals,
+            "children": [_build(ch, [k]) for k, ch in children_items],
+        }
+        # Aggregate metrics for quick display
+        def _count(n: Dict[str, Any]) -> int:
+            return len(n["terminal_requests"]) + sum(_count(c) for c in n["children"])
+        out["subtree_request_count"] = _count(out)
+        return out
+
+    roots = [_build(ch, [k]) for k, ch in raw_root["children"].items()]
+    return roots
+
+
 def build_agent_tree(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return a tree of agent activity for the session.
 

@@ -20,6 +20,8 @@ from pathlib import Path
 from trace_db import (
     build_agent_tree,
     build_history_chains,
+    build_prefix_trie,
+    build_time_trajectory,
     build_timeline,
     clear_traces,
     get_agent_call,
@@ -1547,6 +1549,15 @@ async def api_session_history(session_id: str):
 @app.get("/api/v2/sessions/{session_id}/agents")
 async def api_session_agents(session_id: str):
     return {"session_id": session_id, "roots": build_agent_tree(session_id)}
+
+@app.get("/api/v2/sessions/{session_id}/prefix_trie")
+async def api_session_prefix_trie(session_id: str):
+    return {"session_id": session_id, "roots": build_prefix_trie(session_id)}
+
+@app.get("/api/v2/sessions/{session_id}/time_trajectory")
+async def api_session_time_trajectory(session_id: str):
+    data = build_time_trajectory(session_id)
+    return {"session_id": session_id, **data}
 
 @app.get("/api/v2/requests")
 async def api_list_requests(session_id: Optional[str] = None,

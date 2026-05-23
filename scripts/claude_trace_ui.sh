@@ -21,7 +21,7 @@ Usage: scripts/claude_trace_ui.sh [options] [-- extra claude args]
 Starts the trace gateway if needed, then launches Claude Code pointed at it.
 
 Options:
-  --clear-trace          Clear /api/traces before launching Claude Code.
+  --clear-trace          Clear /api/v2/traces before launching Claude Code.
   --no-server           Do not auto-start the FastAPI gateway.
   --port PORT           Gateway port, default 8082.
   --host HOST           Gateway host, default 127.0.0.1.
@@ -108,7 +108,7 @@ fi
 mkdir -p "$(dirname "$SERVER_LOG")"
 
 server_ready() {
-  curl -fsS "${BASE_URL}/api/traces" >/dev/null 2>&1
+  curl -fsS "${BASE_URL}/api/v2/stats" >/dev/null 2>&1
 }
 
 if [[ "$START_SERVER" == "1" ]]; then
@@ -143,8 +143,8 @@ if [[ "$START_SERVER" == "1" ]]; then
 fi
 
 if [[ "$CLEAR_TRACE" == "1" ]]; then
-  echo "clearing trace at ${BASE_URL}/api/traces"
-  curl -fsS -X DELETE "${BASE_URL}/api/traces" >/dev/null
+  echo "clearing trace at ${BASE_URL}/api/v2/traces"
+  curl -fsS -X DELETE "${BASE_URL}/api/v2/traces" >/dev/null
 fi
 
 echo "trace ui: ${BASE_URL}/trace"
