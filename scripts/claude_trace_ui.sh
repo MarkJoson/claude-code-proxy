@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+WORKDIR=$(pwd)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -79,6 +79,10 @@ while [[ $# -gt 0 ]]; do
       MODEL="${2:?missing value for --model}"
       shift 2
       ;;
+    --workdir)
+      WORKDIR="${2:?missing value for --workdir}"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -152,6 +156,7 @@ echo "claude base url: ${BASE_URL}"
 echo "claude model: ${MODEL}"
 echo "gateway log: ${SERVER_LOG}"
 
+cd $WORKDIR
 # --setting-sources local prevents user/global Claude settings from overriding ANTHROPIC_BASE_URL.
 exec env \
   -u ANTHROPIC_AUTH_TOKEN \

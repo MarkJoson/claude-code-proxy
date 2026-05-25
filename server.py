@@ -427,13 +427,21 @@ async def log_requests(request: Request, call_next):
     # Get request details
     method = request.method
     path = request.url.path
-    
+
     # Log only basic request details at debug level
     logger.debug(f"Request: {method} {path}")
-    
+
+    # Debug: Log all incoming requests to /v1/messages
+    if path == "/v1/messages":
+        logger.warning(f"🔴 MIDDLEWARE: Incoming request to {method} {path}")
+
     # Process the request and get the response
     response = await call_next(request)
-    
+
+    # Debug: Log response from /v1/messages
+    if path == "/v1/messages":
+        logger.warning(f"🔴 MIDDLEWARE: Response from {method} {path}, status={response.status_code}")
+
     return response
 
 # Not using validation function as we're using the environment API key
@@ -611,7 +619,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": anthropic_request.temperature,
-        "stream": False,  # Non-streaming only for reliability (match server2.py)
+        "stream": anthropic_request.stream,  # Respect client's stream preference
     }
 
     # Pass thinking through extra_body
@@ -855,11 +863,21 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             usage=Usage(input_tokens=0, output_tokens=0)
         )
 
-async def handle_streaming(response_generator, original_request: MessagesRequest):
+async def handle_streaming(response_generator, original_request: MessagesRequest, trace_id=None, trace_start=None, litellm_request=None):
     """Handle streaming responses from LiteLLM and convert to Anthropic format."""
+    accumulated_response = {
+        "id": None,
+        "model": original_request.original_model or original_request.model,
+        "role": "assistant",
+        "content": [],
+        "stop_reason": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0}
+    }
+
     try:
         # Send message_start event
         message_id = f"msg_{uuid.uuid4().hex[:24]}"  # Format similar to Anthropic's IDs
+        accumulated_response["id"] = message_id
         
         message_data = {
             'type': 'message_start',
@@ -897,6 +915,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         output_tokens = 0
         has_sent_stop_reason = False
         last_tool_index = 0
+
+        # Track tool calls for accumulated response
+        tool_calls_map = {}  # {tool_id: {"name": str, "input": str}}
         
         # Process each chunk
         async for chunk in response_generator:
@@ -993,7 +1014,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                 tool_index = current_index
                                 last_tool_index += 1
                                 anthropic_tool_index = last_tool_index
-                                
+
                                 # Extract function info
                                 if isinstance(tool_call, dict):
                                     function = tool_call.get('function', {})
@@ -1003,7 +1024,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                     function = getattr(tool_call, 'function', None)
                                     name = getattr(function, 'name', '') if function else ''
                                     tool_id = getattr(tool_call, 'id', f"toolu_{uuid.uuid4().hex[:24]}")
-                                
+
+                                # Initialize tool call tracking
+                                if tool_id not in tool_calls_map:
+                                    tool_calls_map[tool_id] = {"name": name, "input": ""}
+
                                 # Start a new tool_use block
                                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anthropic_tool_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {}}})}\n\n"
                                 current_tool_call = tool_call
@@ -1032,10 +1057,14 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                 except (json.JSONDecodeError, TypeError):
                                     # If it's a fragment, treat it as a string
                                     args_json = arguments
-                                
+
                                 # Add to accumulated tool content
                                 tool_content += args_json if isinstance(args_json, str) else ""
-                                
+
+                                # Update tool calls map
+                                if tool_id in tool_calls_map:
+                                    tool_calls_map[tool_id]["input"] += args_json if isinstance(args_json, str) else ""
+
                                 # Send the update
                                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anthropic_tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_json}})}\n\n"
                     
@@ -1064,17 +1093,52 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                             stop_reason = "tool_use"
                         elif finish_reason == "stop":
                             stop_reason = "end_turn"
-                        
+
+                        # Update accumulated response
+                        accumulated_response["stop_reason"] = stop_reason
+                        accumulated_response["usage"]["input_tokens"] = input_tokens
+                        accumulated_response["usage"]["output_tokens"] = output_tokens
+                        if accumulated_text:
+                            accumulated_response["content"].append({"type": "text", "text": accumulated_text})
+
+                        # Add tool calls to accumulated response
+                        for tool_id, tool_data in tool_calls_map.items():
+                            try:
+                                tool_input = json.loads(tool_data["input"]) if tool_data["input"] else {}
+                            except json.JSONDecodeError:
+                                tool_input = {"raw": tool_data["input"]}
+                            accumulated_response["content"].append({
+                                "type": "tool_use",
+                                "id": tool_id,
+                                "name": tool_data["name"],
+                                "input": tool_input
+                            })
+
                         # Send message_delta with stop reason and usage
                         usage = {"output_tokens": output_tokens}
-                        
+
                         yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n"
-                        
+
                         # Send message_stop event
                         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-                        
+
                         # Send final [DONE] marker to match Anthropic's behavior
                         yield "data: [DONE]\n\n"
+
+                        # Record trace completion (after streaming finishes)
+                        if trace_id and trace_start and litellm_request:
+                            try:
+                                trace_request_completed(
+                                    trace_id=trace_id,
+                                    status_code=200,
+                                    duration_ms=monotonic_ms(trace_start),
+                                    converted_request=litellm_request,
+                                    response=accumulated_response,
+                                    extra={"streaming": True},
+                                )
+                            except Exception as trace_err:
+                                logger.error(f"Failed to record streaming trace: {trace_err}")
+
                         return
             except Exception as e:
                 # Log error but continue processing other chunks
@@ -1087,21 +1151,55 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             if tool_index is not None:
                 for i in range(1, last_tool_index + 1):
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
-            
+
             # Close the text content block
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-            
+
             # Send final message_delta with usage
             usage = {"output_tokens": output_tokens}
-            
+
+            # Update accumulated response
+            accumulated_response["stop_reason"] = "end_turn"
+            accumulated_response["usage"]["input_tokens"] = input_tokens
+            accumulated_response["usage"]["output_tokens"] = output_tokens
+            if accumulated_text:
+                accumulated_response["content"].append({"type": "text", "text": accumulated_text})
+
+            # Add tool calls to accumulated response
+            for tool_id, tool_data in tool_calls_map.items():
+                try:
+                    tool_input = json.loads(tool_data["input"]) if tool_data["input"] else {}
+                except json.JSONDecodeError:
+                    tool_input = {"raw": tool_data["input"]}
+                accumulated_response["content"].append({
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": tool_data["name"],
+                    "input": tool_input
+                })
+
             yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': usage})}\n\n"
-            
+
             # Send message_stop event
             yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-            
+
             # Send final [DONE] marker to match Anthropic's behavior
             yield "data: [DONE]\n\n"
-    
+
+            # Record trace completion
+            if trace_id and trace_start and litellm_request:
+                try:
+                    trace_request_completed(
+                        trace_id=trace_id,
+                        status_code=200,
+                        duration_ms=monotonic_ms(trace_start),
+                        converted_request=litellm_request,
+                        response=accumulated_response,
+                        extra={"streaming": True},
+                    )
+                except Exception as trace_err:
+                    logger.error(f"Failed to record streaming trace: {trace_err}")
+
     except Exception as e:
         import traceback
         error_traceback = traceback.format_exc()
@@ -1126,10 +1224,14 @@ async def create_message(
     trace_start = time.time()
     litellm_request = None
     body_json: Dict[str, Any] = {}
+
+    # Debug: Log entry to this endpoint
+    logger.warning(f"🔵 ENDPOINT ENTRY: /v1/messages - trace_id={trace_id}")
+
     try:
         # print the body here
         body = await raw_request.body()
-    
+
         # Parse the raw body as JSON since it's bytes
         body_json = json.loads(body.decode('utf-8'))
         original_model = body_json.get("model", "unknown")
@@ -1275,8 +1377,8 @@ async def create_message(
         
         # Only log basic info about the request, not the full details
         logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
-        
-        # Always use non-streaming (match server2.py for reliability)
+
+        # Handle streaming vs non-streaming based on client request
         num_tools = len(request.tools) if request.tools else 0
 
         log_request_beautifully(
@@ -1289,6 +1391,65 @@ async def create_message(
             200
         )
         start_time = time.time()
+
+        # Check if client requested streaming
+        if request.stream:
+            logger.warning(f"🟡 STREAMING MODE: trace_id={trace_id}, model={litellm_request.get('model')}")
+
+            # Retry transient upstream errors (rate limits, 5xx, timeouts) with
+            # exponential backoff. Configurable via LITELLM_MAX_RETRIES env.
+            max_retries = int(os.environ.get("LITELLM_MAX_RETRIES", "3"))
+            base_delay = float(os.environ.get("LITELLM_RETRY_BASE_DELAY", "2"))
+            litellm_response = None
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    # Debug: Log before making upstream call
+                    logger.warning(f"🟢 UPSTREAM STREAMING CALL START: trace_id={trace_id}, attempt={attempt+1}/{max_retries+1}, model={litellm_request.get('model')}")
+
+                    # Async call so a slow upstream / retry sleep doesn't block
+                    # other concurrent requests on the event loop.
+                    litellm_response = await litellm.acompletion(**litellm_request)
+
+                    # Debug: Log after successful upstream call
+                    logger.warning(f"🟢 UPSTREAM STREAMING CALL SUCCESS: trace_id={trace_id}, attempt={attempt+1}")
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    status_code = getattr(exc, "status_code", None)
+                    exc_name = type(exc).__name__
+                    is_transient = (
+                        isinstance(exc, getattr(litellm, "RateLimitError", tuple()))
+                        or isinstance(exc, getattr(litellm, "Timeout", tuple()))
+                        or isinstance(exc, getattr(litellm, "APIConnectionError", tuple()))
+                        or isinstance(exc, getattr(litellm, "InternalServerError", tuple()))
+                        or isinstance(exc, getattr(litellm, "ServiceUnavailableError", tuple()))
+                        or status_code in (408, 425, 429, 500, 502, 503, 504)
+                    )
+                    if not is_transient or attempt >= max_retries:
+                        raise
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        f"⏳ Transient error ({exc_name}, status={status_code}) "
+                        f"on attempt {attempt + 1}/{max_retries + 1}; "
+                        f"retrying in {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+
+            # Return streaming response
+            return StreamingResponse(
+                handle_streaming(litellm_response, request, trace_id, trace_start, litellm_request),
+                media_type="text/event-stream"
+            )
+
+        # Non-streaming mode
+        logger.warning(f"🟡 NON-STREAMING MODE: trace_id={trace_id}, model={litellm_request.get('model')}")
+
+        # Retry transient upstream errors (rate limits, 5xx, timeouts) with
+        # exponential backoff. Configurable via LITELLM_MAX_RETRIES env.
+        # Non-streaming mode
+        logger.warning(f"🟡 NON-STREAMING MODE: trace_id={trace_id}, model={litellm_request.get('model')}")
+
         # Retry transient upstream errors (rate limits, 5xx, timeouts) with
         # exponential backoff. Configurable via LITELLM_MAX_RETRIES env.
         max_retries = int(os.environ.get("LITELLM_MAX_RETRIES", "3"))
@@ -1297,9 +1458,15 @@ async def create_message(
         last_exc = None
         for attempt in range(max_retries + 1):
             try:
+                # Debug: Log before making upstream call
+                logger.warning(f"🟢 UPSTREAM CALL START: trace_id={trace_id}, attempt={attempt+1}/{max_retries+1}, model={litellm_request.get('model')}")
+
                 # Async call so a slow upstream / retry sleep doesn't block
                 # other concurrent requests on the event loop.
                 litellm_response = await litellm.acompletion(**litellm_request)
+
+                # Debug: Log after successful upstream call
+                logger.warning(f"🟢 UPSTREAM CALL SUCCESS: trace_id={trace_id}, attempt={attempt+1}")
                 break
             except Exception as exc:
                 last_exc = exc

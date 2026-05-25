@@ -38,3 +38,5 @@ cc_traces/
 .vscode/
 *.swp
 *.swo
+
+.claude
