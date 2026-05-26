@@ -42,6 +42,10 @@ from trace_db import (
 
 import litellm
 litellm.ssl_verify = False
+# Allow LiteLLM to auto-fix params for upstream compatibility, e.g. dropping
+# `thinking` when assistant history lacks thinking_blocks. See
+# litellm/llms/anthropic/chat/transformation.py: transform_request.
+litellm.modify_params = True
 # litellm.drop_params = True
 
 # Load environment variables from .env file
@@ -709,14 +713,29 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             thinking_dict = thinking_dict.dict()
         elif hasattr(thinking_dict, 'model_dump'):
             thinking_dict = thinking_dict.model_dump()
-        
+
         # 仅对 Qwen3 系列模型做映射
         model_lower = anthropic_request.model.lower()
         if "qwen3" in model_lower and isinstance(thinking_dict, dict):
             if thinking_dict.get("type") == "adaptive":
                 thinking_dict["type"] = "auto"
-        
-        litellm_request["extra_body"] = {"thinking": thinking_dict}
+
+        # For Anthropic-compatible APIs (DeepSeek, etc.): if any prior assistant
+        # message has tool_calls but no thinking_blocks, drop the thinking param
+        # to avoid the upstream error "content[].thinking must be passed back".
+        # This happens when the client is in a multi-turn tool-use flow with a
+        # previous turn whose thinking blocks weren't preserved.
+        should_drop_thinking = False
+        if anthropic_request.model.startswith("anthropic/"):
+            for m in messages:
+                if m.get("role") == "assistant" and m.get("tool_calls") and not m.get("thinking_blocks"):
+                    should_drop_thinking = True
+                    break
+
+        if should_drop_thinking:
+            logger.debug("Dropping thinking param: prior assistant tool_calls lack thinking_blocks")
+        else:
+            litellm_request["extra_body"] = {"thinking": thinking_dict}
 
     # Add optional parameters if present
     if anthropic_request.stop_sequences:
