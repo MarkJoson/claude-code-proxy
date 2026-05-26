@@ -205,13 +205,17 @@ class ContentBlockToolResult(BaseModel):
     tool_use_id: str
     content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any]
 
+class ContentBlockThinking(BaseModel):
+    type: Literal["thinking"]
+    thinking: str
+
 class SystemContent(BaseModel):
     type: Literal["text"]
     text: str
 
 class Message(BaseModel):
-    role: Literal["user", "assistant"] 
-    content: Union[str, List[Union[ContentBlockText, ContentBlockImage, ContentBlockToolUse, ContentBlockToolResult]]]
+    role: Literal["user", "assistant"]
+    content: Union[str, List[Union[ContentBlockText, ContentBlockImage, ContentBlockToolUse, ContentBlockToolResult, ContentBlockThinking]]]
 
 class Tool(BaseModel):
     name: str
@@ -587,39 +591,72 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             continue
 
         if msg.role == "assistant":
-            # Split text vs tool_use; emit a single assistant message with
-            # OpenAI-style `tool_calls`.
-            text_parts = []
-            tool_calls = []
-            for block in content:
-                btype = _block_attr(block, "type")
-                if btype == "text":
-                    text_parts.append(_block_attr(block, "text", "") or "")
-                elif btype == "tool_use":
-                    tool_input = _block_attr(block, "input", {}) or {}
-                    if not isinstance(tool_input, str):
-                        try:
-                            arguments_str = json.dumps(tool_input, ensure_ascii=False)
-                        except (TypeError, ValueError):
-                            arguments_str = str(tool_input)
-                    else:
-                        arguments_str = tool_input
-                    tool_calls.append({
-                        "id": _block_attr(block, "id", "") or "",
-                        "type": "function",
-                        "function": {
-                            "name": _block_attr(block, "name", "") or "",
-                            "arguments": arguments_str,
-                        },
-                    })
+            # For Anthropic models, preserve the original content structure including thinking blocks
+            is_anthropic_model = anthropic_request.model.startswith("anthropic/")
 
-            assistant_msg = {"role": "assistant"}
-            joined_text = "\n".join(t for t in text_parts if t)
-            # OpenAI requires content to be present; null is allowed when tool_calls are set.
-            assistant_msg["content"] = joined_text if joined_text else (None if tool_calls else "")
-            if tool_calls:
-                assistant_msg["tool_calls"] = tool_calls
-            messages.append(assistant_msg)
+            if is_anthropic_model:
+                # Keep Anthropic format: preserve all content blocks including thinking
+                anthropic_content = []
+                for block in content:
+                    btype = _block_attr(block, "type")
+                    if btype == "text":
+                        anthropic_content.append({
+                            "type": "text",
+                            "text": _block_attr(block, "text", "") or ""
+                        })
+                    elif btype == "thinking":
+                        anthropic_content.append({
+                            "type": "thinking",
+                            "thinking": _block_attr(block, "thinking", "") or ""
+                        })
+                    elif btype == "tool_use":
+                        anthropic_content.append({
+                            "type": "tool_use",
+                            "id": _block_attr(block, "id", "") or "",
+                            "name": _block_attr(block, "name", "") or "",
+                            "input": _block_attr(block, "input", {}) or {}
+                        })
+                messages.append({"role": "assistant", "content": anthropic_content})
+            else:
+                # For OpenAI/Gemini: convert to OpenAI-style tool_calls format
+                # Split text vs tool_use; emit a single assistant message with
+                # OpenAI-style `tool_calls`.
+                text_parts = []
+                tool_calls = []
+                for block in content:
+                    btype = _block_attr(block, "type")
+                    if btype == "text":
+                        text_parts.append(_block_attr(block, "text", "") or "")
+                    elif btype == "thinking":
+                        # For non-Anthropic models, include thinking as text
+                        thinking_text = _block_attr(block, "thinking", "") or ""
+                        if thinking_text:
+                            text_parts.append(f"[Thinking: {thinking_text}]")
+                    elif btype == "tool_use":
+                        tool_input = _block_attr(block, "input", {}) or {}
+                        if not isinstance(tool_input, str):
+                            try:
+                                arguments_str = json.dumps(tool_input, ensure_ascii=False)
+                            except (TypeError, ValueError):
+                                arguments_str = str(tool_input)
+                        else:
+                            arguments_str = tool_input
+                        tool_calls.append({
+                            "id": _block_attr(block, "id", "") or "",
+                            "type": "function",
+                            "function": {
+                                "name": _block_attr(block, "name", "") or "",
+                                "arguments": arguments_str,
+                            },
+                        })
+
+                assistant_msg = {"role": "assistant"}
+                joined_text = "\n".join(t for t in text_parts if t)
+                # OpenAI requires content to be present; null is allowed when tool_calls are set.
+                assistant_msg["content"] = joined_text if joined_text else (None if tool_calls else "")
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
+                messages.append(assistant_msg)
             continue
 
         # role == "user": tool_result blocks become standalone `tool` role
