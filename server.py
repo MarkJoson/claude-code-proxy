@@ -702,41 +702,60 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.top_k:
         litellm_request["top_k"] = anthropic_request.top_k
     
-    # Convert tools to OpenAI format
+    # Convert tools to OpenAI format (but keep Anthropic format for Anthropic models)
     if anthropic_request.tools:
-        openai_tools = []
+        is_anthropic_model = anthropic_request.model.startswith("anthropic/")
         is_gemini_model = anthropic_request.model.startswith("gemini/")
 
-        for tool in anthropic_request.tools:
-            # Convert to dict if it's a pydantic model
-            if hasattr(tool, 'dict'):
-                tool_dict = tool.dict()
-            else:
-                # Ensure tool_dict is a dictionary, handle potential errors if 'tool' isn't dict-like
-                try:
-                    tool_dict = dict(tool) if not isinstance(tool, dict) else tool
-                except (TypeError, ValueError):
-                     logger.error(f"Could not convert tool to dict: {tool}")
-                     continue # Skip this tool if conversion fails
+        if is_anthropic_model:
+            # For Anthropic models, keep tools in native Anthropic format
+            # LiteLLM will pass them through to the Anthropic API as-is
+            anthropic_tools = []
+            for tool in anthropic_request.tools:
+                # Convert to dict if it's a pydantic model
+                if hasattr(tool, 'dict'):
+                    tool_dict = tool.dict()
+                else:
+                    try:
+                        tool_dict = dict(tool) if not isinstance(tool, dict) else tool
+                    except (TypeError, ValueError):
+                        logger.error(f"Could not convert tool to dict: {tool}")
+                        continue
+                anthropic_tools.append(tool_dict)
+            litellm_request["tools"] = anthropic_tools
+        else:
+            # For OpenAI and Gemini models, convert to OpenAI format
+            openai_tools = []
+            for tool in anthropic_request.tools:
+                # Convert to dict if it's a pydantic model
+                if hasattr(tool, 'dict'):
+                    tool_dict = tool.dict()
+                else:
+                    # Ensure tool_dict is a dictionary, handle potential errors if 'tool' isn't dict-like
+                    try:
+                        tool_dict = dict(tool) if not isinstance(tool, dict) else tool
+                    except (TypeError, ValueError):
+                         logger.error(f"Could not convert tool to dict: {tool}")
+                         continue # Skip this tool if conversion fails
 
-            # Clean the schema if targeting a Gemini model
-            input_schema = tool_dict.get("input_schema", {})
-            if is_gemini_model:
-                 logger.debug(f"Cleaning schema for Gemini tool: {tool_dict.get('name')}")
-                 input_schema = clean_gemini_schema(input_schema)
+                # Clean the schema if targeting a Gemini model
+                input_schema = tool_dict.get("input_schema", {})
+                if is_gemini_model:
+                     logger.debug(f"Cleaning schema for Gemini tool: {tool_dict.get('name')}")
+                     input_schema = clean_gemini_schema(input_schema)
 
-            # Create OpenAI-compatible function tool
-            openai_tool = {
-                "type": "function",
-                "function": {
-                    "name": tool_dict["name"],
-                    "description": tool_dict.get("description", ""),
-                    "parameters": input_schema # Use potentially cleaned schema
+                # Create OpenAI-compatible function tool
+                openai_tool = {
+                    "type": "function",
+                    "function": {
+                        "name": tool_dict["name"],
+                        "description": tool_dict.get("description", ""),
+                        "parameters": input_schema # Use potentially cleaned schema
+                    }
                 }
-            }
-            openai_tools.append(openai_tool)
+                openai_tools.append(openai_tool)
 
-        litellm_request["tools"] = openai_tools
+            litellm_request["tools"] = openai_tools
     
     # Convert tool_choice to OpenAI format if present
     if anthropic_request.tool_choice:
