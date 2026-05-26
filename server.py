@@ -42,6 +42,11 @@ from trace_db import (
 
 import litellm
 litellm.ssl_verify = False
+# Suppress LiteLLM's red "Provider List: https://docs.litellm.ai/docs/providers"
+# print spam. It's emitted from get_llm_provider_logic.py whenever an internal
+# provider-resolution attempt fails — often as harmless retries that don't
+# affect the main flow. Real BadRequestErrors still propagate normally.
+litellm.suppress_debug_info = True
 # litellm.drop_params = True
 
 # Load environment variables from .env file
@@ -210,13 +215,18 @@ class ContentBlockToolResult(BaseModel):
     tool_use_id: str
     content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any]
 
+class ContentBlockThinking(BaseModel):
+    type: Literal["thinking"]
+    thinking: str
+    signature: Optional[str] = None  # DeepSeek includes this
+
 class SystemContent(BaseModel):
     type: Literal["text"]
     text: str
 
 class Message(BaseModel):
     role: Literal["user", "assistant"]
-    content: Union[str, List[Union[ContentBlockText, ContentBlockImage, ContentBlockToolUse, ContentBlockToolResult]]]
+    content: Union[str, List[Union[ContentBlockText, ContentBlockImage, ContentBlockToolUse, ContentBlockToolResult, ContentBlockThinking]]]
 
 class Tool(BaseModel):
     name: str
