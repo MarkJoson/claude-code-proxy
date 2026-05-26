@@ -591,121 +591,65 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             continue
 
         if msg.role == "assistant":
-            # For Anthropic models, preserve the original content structure including thinking blocks
+            # Convert to OpenAI-style format. LiteLLM handles the back-conversion
+            # to Anthropic format internally for Anthropic models. We pass thinking
+            # blocks via assistant_content_block["content"] (Anthropic format) so
+            # LiteLLM can preserve them when round-tripping.
             is_anthropic_model = anthropic_request.model.startswith("anthropic/")
 
-            if is_anthropic_model:
-                # Keep Anthropic format: preserve all content blocks including thinking
-                anthropic_content = []
-                for block in content:
-                    btype = _block_attr(block, "type")
-                    if btype == "text":
-                        anthropic_content.append({
-                            "type": "text",
-                            "text": _block_attr(block, "text", "") or ""
-                        })
-                    elif btype == "thinking":
-                        anthropic_content.append({
-                            "type": "thinking",
-                            "thinking": _block_attr(block, "thinking", "") or ""
-                        })
-                    elif btype == "tool_use":
-                        anthropic_content.append({
-                            "type": "tool_use",
-                            "id": _block_attr(block, "id", "") or "",
-                            "name": _block_attr(block, "name", "") or "",
-                            "input": _block_attr(block, "input", {}) or {}
-                        })
-                messages.append({"role": "assistant", "content": anthropic_content})
-            else:
-                # For OpenAI/Gemini: convert to OpenAI-style tool_calls format
-                # Split text vs tool_use; emit a single assistant message with
-                # OpenAI-style `tool_calls`.
-                text_parts = []
-                tool_calls = []
-                for block in content:
-                    btype = _block_attr(block, "type")
-                    if btype == "text":
-                        text_parts.append(_block_attr(block, "text", "") or "")
-                    elif btype == "thinking":
-                        # For non-Anthropic models, include thinking as text
-                        thinking_text = _block_attr(block, "thinking", "") or ""
-                        if thinking_text:
-                            text_parts.append(f"[Thinking: {thinking_text}]")
-                    elif btype == "tool_use":
-                        tool_input = _block_attr(block, "input", {}) or {}
-                        if not isinstance(tool_input, str):
-                            try:
-                                arguments_str = json.dumps(tool_input, ensure_ascii=False)
-                            except (TypeError, ValueError):
-                                arguments_str = str(tool_input)
-                        else:
-                            arguments_str = tool_input
-                        tool_calls.append({
-                            "id": _block_attr(block, "id", "") or "",
-                            "type": "function",
-                            "function": {
-                                "name": _block_attr(block, "name", "") or "",
-                                "arguments": arguments_str,
-                            },
-                        })
-
-                assistant_msg = {"role": "assistant"}
-                joined_text = "\n".join(t for t in text_parts if t)
-                # OpenAI requires content to be present; null is allowed when tool_calls are set.
-                assistant_msg["content"] = joined_text if joined_text else (None if tool_calls else "")
-                if tool_calls:
-                    assistant_msg["tool_calls"] = tool_calls
-                messages.append(assistant_msg)
-            continue
-
-        # role == "user"
-        is_anthropic_model = anthropic_request.model.startswith("anthropic/")
-
-        if is_anthropic_model:
-            # For Anthropic models, keep native format with tool_result blocks
-            # in user messages (not as separate "tool" role messages).
-            anthropic_content = []
+            text_parts = []
+            tool_calls = []
+            thinking_blocks = []
             for block in content:
                 btype = _block_attr(block, "type")
                 if btype == "text":
-                    anthropic_content.append({
-                        "type": "text",
-                        "text": _block_attr(block, "text", "") or ""
-                    })
-                elif btype == "image":
-                    anthropic_content.append({
-                        "type": "image",
-                        "source": _block_attr(block, "source", {})
-                    })
-                elif btype == "tool_result":
-                    tool_result_block = {
-                        "type": "tool_result",
-                        "tool_use_id": _block_attr(block, "tool_use_id", "") or "",
-                    }
-                    result_content = _block_attr(block, "content")
-                    if isinstance(result_content, list):
-                        tool_result_block["content"] = result_content
-                    else:
-                        tool_result_block["content"] = parse_tool_result_content(result_content)
-                    is_error = _block_attr(block, "is_error")
-                    if is_error:
-                        tool_result_block["is_error"] = True
-                    anthropic_content.append(tool_result_block)
+                    text_parts.append(_block_attr(block, "text", "") or "")
+                elif btype == "thinking":
+                    thinking_text = _block_attr(block, "thinking", "") or ""
+                    if is_anthropic_model and thinking_text:
+                        # Preserve thinking blocks for Anthropic models so they
+                        # can be passed back to the API in thinking mode.
+                        thinking_blocks.append({
+                            "type": "thinking",
+                            "thinking": thinking_text,
+                        })
+                    elif thinking_text:
+                        text_parts.append(f"[Thinking: {thinking_text}]")
                 elif btype == "tool_use":
-                    # Tolerate stray tool_use on user messages
-                    anthropic_content.append({
-                        "type": "tool_use",
+                    tool_input = _block_attr(block, "input", {}) or {}
+                    if not isinstance(tool_input, str):
+                        try:
+                            arguments_str = json.dumps(tool_input, ensure_ascii=False)
+                        except (TypeError, ValueError):
+                            arguments_str = str(tool_input)
+                    else:
+                        arguments_str = tool_input
+                    tool_calls.append({
                         "id": _block_attr(block, "id", "") or "",
-                        "name": _block_attr(block, "name", "") or "",
-                        "input": _block_attr(block, "input", {}) or {}
+                        "type": "function",
+                        "function": {
+                            "name": _block_attr(block, "name", "") or "",
+                            "arguments": arguments_str,
+                        },
                     })
-            if anthropic_content:
-                messages.append({"role": "user", "content": anthropic_content})
+
+            assistant_msg = {"role": "assistant"}
+            joined_text = "\n".join(t for t in text_parts if t)
+            # OpenAI requires content to be present; null is allowed when tool_calls are set.
+            assistant_msg["content"] = joined_text if joined_text else (None if tool_calls else "")
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            if thinking_blocks:
+                # LiteLLM reads thinking_blocks from this key when transforming
+                # to Anthropic format and prepends them before tool_calls.
+                assistant_msg["thinking_blocks"] = thinking_blocks
+            messages.append(assistant_msg)
             continue
 
-        # For OpenAI/Gemini: tool_result blocks become standalone `tool` role
+        # role == "user": tool_result blocks become standalone `tool` role
         # messages; remaining text/image stays on the user message that follows.
+        # LiteLLM internally converts these back to Anthropic format for
+        # Anthropic models, so we use OpenAI format here uniformly.
         user_text_parts = []
         user_image_blocks = []
         tool_messages = []
@@ -1561,6 +1505,32 @@ async def create_message(
         
         # Only log basic info about the request, not the full details
         logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
+
+        # Debug: log the actual messages being sent for Anthropic models
+        if request.model.startswith("anthropic/"):
+            try:
+                msg_summary = []
+                for i, m in enumerate(litellm_request.get("messages", [])):
+                    role = m.get("role")
+                    if isinstance(m.get("content"), str):
+                        c_summary = f"str({len(m.get('content',''))})"
+                    elif isinstance(m.get("content"), list):
+                        types = [b.get("type") if isinstance(b, dict) else "?" for b in m.get("content", [])]
+                        c_summary = f"list({types})"
+                    else:
+                        c_summary = str(type(m.get("content")))
+                    extras = []
+                    if m.get("tool_calls"):
+                        tc_ids = [tc.get("id") for tc in m["tool_calls"]]
+                        extras.append(f"tool_calls={tc_ids}")
+                    if m.get("tool_call_id"):
+                        extras.append(f"tool_call_id={m.get('tool_call_id')}")
+                    if m.get("thinking_blocks"):
+                        extras.append(f"thinking_blocks={len(m['thinking_blocks'])}")
+                    msg_summary.append(f"[{i}] role={role} content={c_summary} {' '.join(extras)}")
+                logger.warning(f"🔵 ANTHROPIC REQUEST messages:\n" + "\n".join(msg_summary))
+            except Exception as e:
+                logger.warning(f"Failed to log message summary: {e}")
 
         # Handle streaming vs non-streaming based on client request
         num_tools = len(request.tools) if request.tools else 0
