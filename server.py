@@ -1786,6 +1786,10 @@ async def _stream_anthropic_passthrough(
 
                                         elif event_type == "content_block_start":
                                             content_block = event.get("content_block", {})
+                                            # For tool_use blocks, initialize input as empty string
+                                            # since we'll accumulate JSON deltas
+                                            if content_block.get("type") == "tool_use" and "input" in content_block:
+                                                content_block["input"] = ""
                                             reconstructed_response["content"].append(content_block)
 
                                         elif event_type == "content_block_delta":
@@ -1803,6 +1807,8 @@ async def _stream_anthropic_passthrough(
                                                     block["thinking"] += delta.get("thinking", "")
                                                 elif delta.get("type") == "input_json_delta":
                                                     if "input" not in block:
+                                                        block["input"] = ""
+                                                    elif not isinstance(block["input"], str):
                                                         block["input"] = ""
                                                     block["input"] += delta.get("partial_json", "")
 
