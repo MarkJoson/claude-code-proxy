@@ -42,10 +42,6 @@ from trace_db import (
 
 import litellm
 litellm.ssl_verify = False
-# Allow LiteLLM to auto-fix params for upstream compatibility, e.g. dropping
-# `thinking` when assistant history lacks thinking_blocks. See
-# litellm/llms/anthropic/chat/transformation.py: transform_request.
-litellm.modify_params = True
 # litellm.drop_params = True
 
 # Load environment variables from .env file
@@ -124,6 +120,11 @@ USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 
 # Get OpenAI base URL from environment (if set)
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+
+# Get Anthropic base URL from environment (used by the passthrough path).
+# Defaults to the official Anthropic API. Set this to a compatible endpoint
+# (e.g. https://api.deepseek.com/anthropic) to forward requests there.
+ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
 
 # Get preferred provider (default to openai)
 PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
@@ -209,17 +210,13 @@ class ContentBlockToolResult(BaseModel):
     tool_use_id: str
     content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any]
 
-class ContentBlockThinking(BaseModel):
-    type: Literal["thinking"]
-    thinking: str
-
 class SystemContent(BaseModel):
     type: Literal["text"]
     text: str
 
 class Message(BaseModel):
     role: Literal["user", "assistant"]
-    content: Union[str, List[Union[ContentBlockText, ContentBlockImage, ContentBlockToolUse, ContentBlockToolResult, ContentBlockThinking]]]
+    content: Union[str, List[Union[ContentBlockText, ContentBlockImage, ContentBlockToolUse, ContentBlockToolResult]]]
 
 class Tool(BaseModel):
     name: str
@@ -595,30 +592,14 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             continue
 
         if msg.role == "assistant":
-            # Convert to OpenAI-style format. LiteLLM handles the back-conversion
-            # to Anthropic format internally for Anthropic models. We pass thinking
-            # blocks via assistant_content_block["content"] (Anthropic format) so
-            # LiteLLM can preserve them when round-tripping.
-            is_anthropic_model = anthropic_request.model.startswith("anthropic/")
-
+            # Split text vs tool_use; emit a single assistant message with
+            # OpenAI-style `tool_calls`.
             text_parts = []
             tool_calls = []
-            thinking_blocks = []
             for block in content:
                 btype = _block_attr(block, "type")
                 if btype == "text":
                     text_parts.append(_block_attr(block, "text", "") or "")
-                elif btype == "thinking":
-                    thinking_text = _block_attr(block, "thinking", "") or ""
-                    if is_anthropic_model and thinking_text:
-                        # Preserve thinking blocks for Anthropic models so they
-                        # can be passed back to the API in thinking mode.
-                        thinking_blocks.append({
-                            "type": "thinking",
-                            "thinking": thinking_text,
-                        })
-                    elif thinking_text:
-                        text_parts.append(f"[Thinking: {thinking_text}]")
                 elif btype == "tool_use":
                     tool_input = _block_attr(block, "input", {}) or {}
                     if not isinstance(tool_input, str):
@@ -643,17 +624,11 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             assistant_msg["content"] = joined_text if joined_text else (None if tool_calls else "")
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
-            if thinking_blocks:
-                # LiteLLM reads thinking_blocks from this key when transforming
-                # to Anthropic format and prepends them before tool_calls.
-                assistant_msg["thinking_blocks"] = thinking_blocks
             messages.append(assistant_msg)
             continue
 
         # role == "user": tool_result blocks become standalone `tool` role
         # messages; remaining text/image stays on the user message that follows.
-        # LiteLLM internally converts these back to Anthropic format for
-        # Anthropic models, so we use OpenAI format here uniformly.
         user_text_parts = []
         user_image_blocks = []
         tool_messages = []
@@ -720,22 +695,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             if thinking_dict.get("type") == "adaptive":
                 thinking_dict["type"] = "auto"
 
-        # For Anthropic-compatible APIs (DeepSeek, etc.): if any prior assistant
-        # message has tool_calls but no thinking_blocks, drop the thinking param
-        # to avoid the upstream error "content[].thinking must be passed back".
-        # This happens when the client is in a multi-turn tool-use flow with a
-        # previous turn whose thinking blocks weren't preserved.
-        should_drop_thinking = False
-        if anthropic_request.model.startswith("anthropic/"):
-            for m in messages:
-                if m.get("role") == "assistant" and m.get("tool_calls") and not m.get("thinking_blocks"):
-                    should_drop_thinking = True
-                    break
-
-        if should_drop_thinking:
-            logger.debug("Dropping thinking param: prior assistant tool_calls lack thinking_blocks")
-        else:
-            litellm_request["extra_body"] = {"thinking": thinking_dict}
+        litellm_request["extra_body"] = {"thinking": thinking_dict}
 
     # Add optional parameters if present
     if anthropic_request.stop_sequences:
@@ -747,60 +707,41 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.top_k:
         litellm_request["top_k"] = anthropic_request.top_k
     
-    # Convert tools to OpenAI format (but keep Anthropic format for Anthropic models)
+    # Convert tools to OpenAI format
     if anthropic_request.tools:
-        is_anthropic_model = anthropic_request.model.startswith("anthropic/")
+        openai_tools = []
         is_gemini_model = anthropic_request.model.startswith("gemini/")
 
-        if is_anthropic_model:
-            # For Anthropic models, keep tools in native Anthropic format
-            # LiteLLM will pass them through to the Anthropic API as-is
-            anthropic_tools = []
-            for tool in anthropic_request.tools:
-                # Convert to dict if it's a pydantic model
-                if hasattr(tool, 'dict'):
-                    tool_dict = tool.dict()
-                else:
-                    try:
-                        tool_dict = dict(tool) if not isinstance(tool, dict) else tool
-                    except (TypeError, ValueError):
-                        logger.error(f"Could not convert tool to dict: {tool}")
-                        continue
-                anthropic_tools.append(tool_dict)
-            litellm_request["tools"] = anthropic_tools
-        else:
-            # For OpenAI and Gemini models, convert to OpenAI format
-            openai_tools = []
-            for tool in anthropic_request.tools:
-                # Convert to dict if it's a pydantic model
-                if hasattr(tool, 'dict'):
-                    tool_dict = tool.dict()
-                else:
-                    # Ensure tool_dict is a dictionary, handle potential errors if 'tool' isn't dict-like
-                    try:
-                        tool_dict = dict(tool) if not isinstance(tool, dict) else tool
-                    except (TypeError, ValueError):
-                         logger.error(f"Could not convert tool to dict: {tool}")
-                         continue # Skip this tool if conversion fails
+        for tool in anthropic_request.tools:
+            # Convert to dict if it's a pydantic model
+            if hasattr(tool, 'dict'):
+                tool_dict = tool.dict()
+            else:
+                # Ensure tool_dict is a dictionary, handle potential errors if 'tool' isn't dict-like
+                try:
+                    tool_dict = dict(tool) if not isinstance(tool, dict) else tool
+                except (TypeError, ValueError):
+                     logger.error(f"Could not convert tool to dict: {tool}")
+                     continue # Skip this tool if conversion fails
 
-                # Clean the schema if targeting a Gemini model
-                input_schema = tool_dict.get("input_schema", {})
-                if is_gemini_model:
-                     logger.debug(f"Cleaning schema for Gemini tool: {tool_dict.get('name')}")
-                     input_schema = clean_gemini_schema(input_schema)
+            # Clean the schema if targeting a Gemini model
+            input_schema = tool_dict.get("input_schema", {})
+            if is_gemini_model:
+                 logger.debug(f"Cleaning schema for Gemini tool: {tool_dict.get('name')}")
+                 input_schema = clean_gemini_schema(input_schema)
 
-                # Create OpenAI-compatible function tool
-                openai_tool = {
-                    "type": "function",
-                    "function": {
-                        "name": tool_dict["name"],
-                        "description": tool_dict.get("description", ""),
-                        "parameters": input_schema # Use potentially cleaned schema
-                    }
+            # Create OpenAI-compatible function tool
+            openai_tool = {
+                "type": "function",
+                "function": {
+                    "name": tool_dict["name"],
+                    "description": tool_dict.get("description", ""),
+                    "parameters": input_schema # Use potentially cleaned schema
                 }
-                openai_tools.append(openai_tool)
+            }
+            openai_tools.append(openai_tool)
 
-            litellm_request["tools"] = openai_tools
+        litellm_request["tools"] = openai_tools
     
     # Convert tool_choice to OpenAI format if present
     if anthropic_request.tool_choice:
@@ -1407,6 +1348,25 @@ async def create_message(
 
         logger.debug(f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}")
 
+        # Anthropic passthrough: when the upstream is an Anthropic-compatible
+        # API (official Anthropic, DeepSeek's Anthropic endpoint, yunwu.ai,
+        # etc.), bypass LiteLLM's OpenAI-format conversion and forward the
+        # client's raw Anthropic request. This preserves native semantics
+        # (thinking blocks, tool_use/tool_result, server tools) that LiteLLM
+        # doesn't always round-trip correctly.
+        if request.model.startswith("anthropic/"):
+            logger.debug(
+                f"Using Anthropic passthrough to {ANTHROPIC_BASE_URL} for model: {request.model}"
+            )
+            return await _handle_anthropic_passthrough(
+                request=request,
+                raw_request=raw_request,
+                body_json=body_json,
+                trace_id=trace_id,
+                trace_start=trace_start,
+                display_model=display_model,
+            )
+
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
 
@@ -1524,32 +1484,6 @@ async def create_message(
         
         # Only log basic info about the request, not the full details
         logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
-
-        # Debug: log the actual messages being sent for Anthropic models
-        if request.model.startswith("anthropic/"):
-            try:
-                msg_summary = []
-                for i, m in enumerate(litellm_request.get("messages", [])):
-                    role = m.get("role")
-                    if isinstance(m.get("content"), str):
-                        c_summary = f"str({len(m.get('content',''))})"
-                    elif isinstance(m.get("content"), list):
-                        types = [b.get("type") if isinstance(b, dict) else "?" for b in m.get("content", [])]
-                        c_summary = f"list({types})"
-                    else:
-                        c_summary = str(type(m.get("content")))
-                    extras = []
-                    if m.get("tool_calls"):
-                        tc_ids = [tc.get("id") for tc in m["tool_calls"]]
-                        extras.append(f"tool_calls={tc_ids}")
-                    if m.get("tool_call_id"):
-                        extras.append(f"tool_call_id={m.get('tool_call_id')}")
-                    if m.get("thinking_blocks"):
-                        extras.append(f"thinking_blocks={len(m['thinking_blocks'])}")
-                    msg_summary.append(f"[{i}] role={role} content={c_summary} {' '.join(extras)}")
-                logger.warning(f"🔵 ANTHROPIC REQUEST messages:\n" + "\n".join(msg_summary))
-            except Exception as e:
-                logger.warning(f"Failed to log message summary: {e}")
 
         # Handle streaming vs non-streaming based on client request
         num_tools = len(request.tools) if request.tools else 0
@@ -1739,6 +1673,184 @@ async def create_message(
             error=sanitized_details,
         )
         raise HTTPException(status_code=status_code, detail=error_message)
+
+
+# Headers we never want to forward to the upstream Anthropic API.
+_ANTHROPIC_PASSTHROUGH_DROP_HEADERS = {
+    "host",
+    "content-length",
+    "connection",
+    "accept-encoding",
+    "transfer-encoding",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "x-api-key",
+    "authorization",
+    "anthropic-version",
+}
+
+
+def _build_anthropic_passthrough_headers(raw_request: Request) -> Dict[str, str]:
+    """Build headers for the upstream call. Forward client headers but
+    override auth/version/host so the proxy authenticates as itself."""
+    forwarded: Dict[str, str] = {}
+    for k, v in raw_request.headers.items():
+        if k.lower() in _ANTHROPIC_PASSTHROUGH_DROP_HEADERS:
+            continue
+        forwarded[k] = v
+
+    forwarded["content-type"] = "application/json"
+    forwarded["accept"] = forwarded.get("accept", "application/json")
+    forwarded["anthropic-version"] = raw_request.headers.get(
+        "anthropic-version", "2023-06-01"
+    )
+    if ANTHROPIC_API_KEY:
+        forwarded["x-api-key"] = ANTHROPIC_API_KEY
+    return forwarded
+
+
+async def _stream_anthropic_passthrough(
+    body: bytes,
+    headers: Dict[str, str],
+    url: str,
+    trace_id: str,
+    trace_start: float,
+    body_json: Dict[str, Any],
+):
+    """Async generator: stream raw SSE bytes from upstream Anthropic API."""
+    accumulated_text_chunks: List[str] = []
+    upstream_status = 200
+    try:
+        timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+            async with client.stream("POST", url, content=body, headers=headers) as resp:
+                upstream_status = resp.status_code
+                if resp.status_code >= 400:
+                    err_body = await resp.aread()
+                    err_text = err_body.decode("utf-8", errors="replace")
+                    logger.error(
+                        f"Anthropic passthrough upstream error {resp.status_code}: {err_text}"
+                    )
+                    # Surface the upstream error as an SSE error event so the
+                    # client sees a real failure instead of a hung stream.
+                    yield (
+                        f"event: error\ndata: "
+                        f"{json.dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': err_text}})}\n\n"
+                    ).encode("utf-8")
+                    yield b"data: [DONE]\n\n"
+                    return
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        accumulated_text_chunks.append(
+                            chunk.decode("utf-8", errors="replace")
+                        )
+                        yield chunk
+    except Exception as exc:
+        logger.error(f"Anthropic passthrough streaming failed: {exc}")
+        yield (
+            f"event: error\ndata: "
+            f"{json.dumps({'type': 'error', 'error': {'type': 'proxy_error', 'message': str(exc)}})}\n\n"
+        ).encode("utf-8")
+        yield b"data: [DONE]\n\n"
+        upstream_status = 500
+    finally:
+        try:
+            trace_request_completed(
+                trace_id=trace_id,
+                status_code=upstream_status if upstream_status < 400 else 200,
+                duration_ms=monotonic_ms(trace_start),
+                converted_request={"passthrough": True, "body": body_json},
+                response={"streamed": True, "raw_chunks": len(accumulated_text_chunks)},
+                extra={"streaming": True, "passthrough": True},
+            )
+        except Exception as trace_err:
+            logger.error(f"Failed to record passthrough streaming trace: {trace_err}")
+
+
+async def _handle_anthropic_passthrough(
+    request: MessagesRequest,
+    raw_request: Request,
+    body_json: Dict[str, Any],
+    trace_id: str,
+    trace_start: float,
+    display_model: str,
+):
+    """Forward the raw client request to the Anthropic-compatible upstream
+    without going through LiteLLM, preserving native Anthropic semantics
+    (thinking blocks, tool_use/tool_result, server-side tools, etc.)."""
+    # Strip the "anthropic/" prefix LiteLLM uses; the upstream API expects
+    # the bare model name.
+    upstream_model = request.model
+    if upstream_model.startswith("anthropic/"):
+        upstream_model = upstream_model[len("anthropic/"):]
+
+    upstream_body = dict(body_json)
+    upstream_body["model"] = upstream_model
+    upstream_payload = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
+
+    headers = _build_anthropic_passthrough_headers(raw_request)
+    url = f"{ANTHROPIC_BASE_URL}/v1/messages"
+
+    num_tools = len(request.tools) if request.tools else 0
+    log_request_beautifully(
+        "POST",
+        raw_request.url.path,
+        display_model,
+        request.model,
+        len(body_json.get("messages", []) or []),
+        num_tools,
+        200,
+    )
+
+    if request.stream:
+        logger.warning(
+            f"🟡 STREAMING MODE (passthrough): trace_id={trace_id}, model={request.model}"
+        )
+        return StreamingResponse(
+            _stream_anthropic_passthrough(
+                upstream_payload, headers, url, trace_id, trace_start, body_json
+            ),
+            media_type="text/event-stream",
+        )
+
+    logger.warning(
+        f"🟡 NON-STREAMING MODE (passthrough): trace_id={trace_id}, model={request.model}"
+    )
+    timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+        upstream_resp = await client.post(url, content=upstream_payload, headers=headers)
+
+    if upstream_resp.status_code >= 400:
+        err_text = upstream_resp.text
+        logger.error(
+            f"Anthropic passthrough upstream error {upstream_resp.status_code}: {err_text}"
+        )
+        try:
+            err_payload = upstream_resp.json()
+        except Exception:
+            err_payload = {"error": err_text}
+        trace_request_failed(
+            trace_id=trace_id,
+            status_code=upstream_resp.status_code,
+            duration_ms=monotonic_ms(trace_start),
+            converted_request={"passthrough": True, "body": body_json},
+            error={"upstream_error": err_payload},
+        )
+        raise HTTPException(status_code=upstream_resp.status_code, detail=err_text)
+
+    response_json = upstream_resp.json()
+    trace_request_completed(
+        trace_id=trace_id,
+        status_code=200,
+        duration_ms=monotonic_ms(trace_start),
+        converted_request={"passthrough": True, "body": body_json},
+        response=response_json,
+        extra={"upstream_response": response_json, "passthrough": True},
+    )
+    return JSONResponse(content=response_json, status_code=200)
+
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(
