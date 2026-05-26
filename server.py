@@ -1732,6 +1732,19 @@ async def _stream_anthropic_passthrough(
     """Async generator: stream raw SSE bytes from upstream Anthropic API."""
     accumulated_text_chunks: List[str] = []
     upstream_status = 200
+
+    # Reconstruct the final response from SSE events for trace recording
+    reconstructed_response: Dict[str, Any] = {
+        "id": None,
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": None,
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0}
+    }
+
     try:
         timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
         async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
@@ -1753,9 +1766,59 @@ async def _stream_anthropic_passthrough(
                     return
                 async for chunk in resp.aiter_bytes():
                     if chunk:
-                        accumulated_text_chunks.append(
-                            chunk.decode("utf-8", errors="replace")
-                        )
+                        chunk_text = chunk.decode("utf-8", errors="replace")
+                        accumulated_text_chunks.append(chunk_text)
+
+                        # Parse SSE events to reconstruct response
+                        for line in chunk_text.split("\n"):
+                            if line.startswith("data: "):
+                                data_str = line[6:].strip()
+                                if data_str and data_str != "[DONE]":
+                                    try:
+                                        event = json.loads(data_str)
+                                        event_type = event.get("type")
+
+                                        if event_type == "message_start":
+                                            msg = event.get("message", {})
+                                            reconstructed_response["id"] = msg.get("id")
+                                            reconstructed_response["model"] = msg.get("model")
+                                            reconstructed_response["usage"] = msg.get("usage", reconstructed_response["usage"])
+
+                                        elif event_type == "content_block_start":
+                                            content_block = event.get("content_block", {})
+                                            reconstructed_response["content"].append(content_block)
+
+                                        elif event_type == "content_block_delta":
+                                            delta = event.get("delta", {})
+                                            index = event.get("index", 0)
+                                            if index < len(reconstructed_response["content"]):
+                                                block = reconstructed_response["content"][index]
+                                                if delta.get("type") == "text_delta":
+                                                    if "text" not in block:
+                                                        block["text"] = ""
+                                                    block["text"] += delta.get("text", "")
+                                                elif delta.get("type") == "thinking_delta":
+                                                    if "thinking" not in block:
+                                                        block["thinking"] = ""
+                                                    block["thinking"] += delta.get("thinking", "")
+                                                elif delta.get("type") == "input_json_delta":
+                                                    if "input" not in block:
+                                                        block["input"] = ""
+                                                    block["input"] += delta.get("partial_json", "")
+
+                                        elif event_type == "message_delta":
+                                            delta = event.get("delta", {})
+                                            if "stop_reason" in delta:
+                                                reconstructed_response["stop_reason"] = delta["stop_reason"]
+                                            if "stop_sequence" in delta:
+                                                reconstructed_response["stop_sequence"] = delta["stop_sequence"]
+                                            usage = event.get("usage", {})
+                                            if usage:
+                                                reconstructed_response["usage"]["output_tokens"] = usage.get("output_tokens", 0)
+
+                                    except json.JSONDecodeError:
+                                        pass
+
                         yield chunk
     except Exception as exc:
         logger.error(f"Anthropic passthrough streaming failed: {exc}")
@@ -1767,12 +1830,20 @@ async def _stream_anthropic_passthrough(
         upstream_status = 500
     finally:
         try:
+            # Parse tool_use blocks' input from accumulated JSON strings
+            for block in reconstructed_response.get("content", []):
+                if block.get("type") == "tool_use" and isinstance(block.get("input"), str):
+                    try:
+                        block["input"] = json.loads(block["input"])
+                    except json.JSONDecodeError:
+                        pass
+
             trace_request_completed(
                 trace_id=trace_id,
                 status_code=upstream_status if upstream_status < 400 else 200,
                 duration_ms=monotonic_ms(trace_start),
                 converted_request={"passthrough": True, "body": body_json},
-                response={"streamed": True, "raw_chunks": len(accumulated_text_chunks)},
+                response=reconstructed_response,
                 extra={"streaming": True, "passthrough": True},
             )
         except Exception as trace_err:
