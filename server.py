@@ -659,7 +659,52 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 messages.append(assistant_msg)
             continue
 
-        # role == "user": tool_result blocks become standalone `tool` role
+        # role == "user"
+        is_anthropic_model = anthropic_request.model.startswith("anthropic/")
+
+        if is_anthropic_model:
+            # For Anthropic models, keep native format with tool_result blocks
+            # in user messages (not as separate "tool" role messages).
+            anthropic_content = []
+            for block in content:
+                btype = _block_attr(block, "type")
+                if btype == "text":
+                    anthropic_content.append({
+                        "type": "text",
+                        "text": _block_attr(block, "text", "") or ""
+                    })
+                elif btype == "image":
+                    anthropic_content.append({
+                        "type": "image",
+                        "source": _block_attr(block, "source", {})
+                    })
+                elif btype == "tool_result":
+                    tool_result_block = {
+                        "type": "tool_result",
+                        "tool_use_id": _block_attr(block, "tool_use_id", "") or "",
+                    }
+                    result_content = _block_attr(block, "content")
+                    if isinstance(result_content, list):
+                        tool_result_block["content"] = result_content
+                    else:
+                        tool_result_block["content"] = parse_tool_result_content(result_content)
+                    is_error = _block_attr(block, "is_error")
+                    if is_error:
+                        tool_result_block["is_error"] = True
+                    anthropic_content.append(tool_result_block)
+                elif btype == "tool_use":
+                    # Tolerate stray tool_use on user messages
+                    anthropic_content.append({
+                        "type": "tool_use",
+                        "id": _block_attr(block, "id", "") or "",
+                        "name": _block_attr(block, "name", "") or "",
+                        "input": _block_attr(block, "input", {}) or {}
+                    })
+            if anthropic_content:
+                messages.append({"role": "user", "content": anthropic_content})
+            continue
+
+        # For OpenAI/Gemini: tool_result blocks become standalone `tool` role
         # messages; remaining text/image stays on the user message that follows.
         user_text_parts = []
         user_image_blocks = []
