@@ -129,6 +129,14 @@ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
 
+# Get default model context limits from environment (optional overrides)
+DEFAULT_MAX_INPUT_TOKENS = os.environ.get("DEFAULT_MAX_INPUT_TOKENS")
+DEFAULT_MAX_OUTPUT_TOKENS = os.environ.get("DEFAULT_MAX_OUTPUT_TOKENS")
+if DEFAULT_MAX_INPUT_TOKENS:
+    DEFAULT_MAX_INPUT_TOKENS = int(DEFAULT_MAX_INPUT_TOKENS)
+if DEFAULT_MAX_OUTPUT_TOKENS:
+    DEFAULT_MAX_OUTPUT_TOKENS = int(DEFAULT_MAX_OUTPUT_TOKENS)
+
 # Test-only mode: record real client requests but skip upstream LLM calls.
 TRACE_ECHO_ONLY = os.environ.get("CC_TRACE_ECHO_ONLY", "false").lower() in {"1", "true", "yes", "on"}
 
@@ -390,6 +398,11 @@ class Usage(BaseModel):
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
 
+class ModelInfo(BaseModel):
+    """Model capability information to inform Claude Code about actual model limits."""
+    max_input_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+
 class MessagesResponse(BaseModel):
     id: str
     model: str
@@ -399,6 +412,7 @@ class MessagesResponse(BaseModel):
     stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]] = None
     stop_sequence: Optional[str] = None
     usage: Usage
+    model_info: Optional[ModelInfo] = None  # Add model capability information
 
 def estimate_trace_echo_tokens(value: Any) -> int:
     try:
@@ -406,6 +420,46 @@ def estimate_trace_echo_tokens(value: Any) -> int:
     except Exception:
         text = str(value)
     return max(1, len(text) // 4)
+
+
+def get_model_context_info(model_name: str) -> Optional[ModelInfo]:
+    """Get context window information for a model using litellm.
+
+    Falls back to environment variable defaults if model info is not available.
+    """
+    try:
+        info = litellm.get_model_info(model_name)
+        max_input = info.get("max_input_tokens")
+        max_output = info.get("max_output_tokens")
+
+        # Use environment variable defaults if litellm doesn't have the info
+        if max_input is None and DEFAULT_MAX_INPUT_TOKENS is not None:
+            max_input = DEFAULT_MAX_INPUT_TOKENS
+            logger.debug(f"Using DEFAULT_MAX_INPUT_TOKENS={max_input} for {model_name}")
+
+        if max_output is None and DEFAULT_MAX_OUTPUT_TOKENS is not None:
+            max_output = DEFAULT_MAX_OUTPUT_TOKENS
+            logger.debug(f"Using DEFAULT_MAX_OUTPUT_TOKENS={max_output} for {model_name}")
+
+        # Only return ModelInfo if we have at least one value
+        if max_input is not None or max_output is not None:
+            return ModelInfo(
+                max_input_tokens=max_input,
+                max_output_tokens=max_output
+            )
+        return None
+
+    except Exception as e:
+        logger.debug(f"Could not get model info for {model_name}: {e}")
+
+        # Fall back to environment defaults if available
+        if DEFAULT_MAX_INPUT_TOKENS is not None or DEFAULT_MAX_OUTPUT_TOKENS is not None:
+            logger.debug(f"Using environment defaults for {model_name}")
+            return ModelInfo(
+                max_input_tokens=DEFAULT_MAX_INPUT_TOKENS,
+                max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS
+            )
+        return None
 
 
 def build_trace_echo_response(original_request: MessagesRequest) -> MessagesResponse:
@@ -708,10 +762,10 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     
     return litellm_request
 
-def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any], 
+def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
                                  original_request: MessagesRequest) -> MessagesResponse:
     """Convert LiteLLM (OpenAI format) response to Anthropic API response format."""
-    
+
     # Enhanced response extraction with better error handling
     try:
         # Get the clean model name to check capabilities
@@ -720,6 +774,11 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             clean_model = clean_model[len("anthropic/"):]
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/"):]
+        elif clean_model.startswith("gemini/"):
+            clean_model = clean_model[len("gemini/"):]
+
+        # Get model context information for the actual model being used
+        model_info = get_model_context_info(clean_model)
 
         # Handle ModelResponse object from LiteLLM
         if hasattr(litellm_response, 'choices') and hasattr(litellm_response, 'usage'):
@@ -842,7 +901,8 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             usage=Usage(
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens
-            )
+            ),
+            model_info=model_info  # Add model context information
         )
         
         return anthropic_response
@@ -860,7 +920,8 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             role="assistant",
             content=[{"type": "text", "text": f"Error converting response: {str(e)}. Please check server logs."}],
             stop_reason="end_turn",
-            usage=Usage(input_tokens=0, output_tokens=0)
+            usage=Usage(input_tokens=0, output_tokens=0),
+            model_info=None
         )
 
 async def handle_streaming(response_generator, original_request: MessagesRequest, trace_id=None, trace_start=None, litellm_request=None):
@@ -874,11 +935,28 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         "usage": {"input_tokens": 0, "output_tokens": 0}
     }
 
+    # Get model context information for the actual model being used
+    clean_model = original_request.model
+    if clean_model.startswith("anthropic/"):
+        clean_model = clean_model[len("anthropic/"):]
+    elif clean_model.startswith("openai/"):
+        clean_model = clean_model[len("openai/"):]
+    elif clean_model.startswith("gemini/"):
+        clean_model = clean_model[len("gemini/"):]
+
+    model_info = get_model_context_info(clean_model)
+    model_info_dict = None
+    if model_info:
+        model_info_dict = {
+            "max_input_tokens": model_info.max_input_tokens,
+            "max_output_tokens": model_info.max_output_tokens
+        }
+
     try:
         # Send message_start event
         message_id = f"msg_{uuid.uuid4().hex[:24]}"  # Format similar to Anthropic's IDs
         accumulated_response["id"] = message_id
-        
+
         message_data = {
             'type': 'message_start',
             'message': {
@@ -897,6 +975,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 }
             }
         }
+
+        # Add model_info to message_start if available
+        if model_info_dict:
+            message_data['message']['model_info'] = model_info_dict
+
         yield f"event: message_start\ndata: {json.dumps(message_data)}\n\n"
         
         # Content block index for the first text block
