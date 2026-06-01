@@ -575,6 +575,7 @@
   <div class="actions">
     <input id="search" type="search" placeholder="过滤: trace_id / role / model / tool" />
     <button id="autoRefresh" type="button">自动: 关</button>
+    <button id="traceToggle" type="button">轨迹: ?</button>
     <button id="refresh" type="button">刷新</button>
     <button id="clear" type="button">清空</button>
   </div>
@@ -1909,6 +1910,40 @@ $('autoRefresh').addEventListener('click', () => {
   }
 });
 
+async function initTraceToggle() {
+  try {
+    const data = await fetchJson('/api/v2/trace/enabled');
+    updateTraceToggleUI(data.enabled);
+  } catch (e) {
+    updateTraceToggleUI(null);
+  }
+  $('traceToggle').addEventListener('click', async () => {
+    const btn = $('traceToggle');
+    btn.disabled = true;
+    try {
+      const cur = await fetchJson('/api/v2/trace/enabled');
+      const next = !cur.enabled;
+      await fetch('/api/v2/trace/enabled', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      });
+      updateTraceToggleUI(next);
+    } catch (e) {
+      updateTraceToggleUI(null);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+function updateTraceToggleUI(enabled) {
+  const btn = $('traceToggle');
+  if (enabled === null) { btn.textContent = '轨迹: ?'; btn.classList.remove('active'); return; }
+  btn.textContent = enabled ? '轨迹: 开' : '轨迹: 关';
+  btn.classList.toggle('active', enabled);
+}
+
+initTraceToggle();
 loadSessions().catch((err) => {
   console.error(err);
   $('mainView').innerHTML = `<div class="empty">加载失败: ${escapeHtml(err.message)}</div>`;

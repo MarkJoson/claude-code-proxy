@@ -2213,8 +2213,14 @@ def log_request_beautifully(method, path, claude_model, openai_model, num_messag
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--help":
-        print("Run with: uvicorn server:app --host 0.0.0.0 --port 8082 --workers 4")
+    if "--trace-disabled" in sys.argv:
+        set_trace_enabled(False)
+        logger.warning("Trace collection DISABLED by --trace-disabled flag")
+    if "--help" in sys.argv:
+        print("Usage: python server.py [--trace-disabled]")
+        print("  --trace-disabled  Start with trajectory collection turned off")
+        print()
+        print("Or run with: uvicorn server:app --host 0.0.0.0 --port 8082 --workers 4")
         sys.exit(0)
 
     # Concurrency tuning via env:
