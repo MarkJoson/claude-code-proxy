@@ -146,13 +146,27 @@ def headers_to_dict(headers: Iterable[Tuple[str, str]]) -> Dict[str, str]:
     return {key: sanitize(value, key) for key, value in headers}
 
 
+_trace_enabled_override: Optional[bool] = None
+
+
 def is_trace_enabled() -> bool:
+    if _trace_enabled_override is not None:
+        return _trace_enabled_override
     return os.environ.get("CC_TRACE_ENABLED", "true").lower() not in {
         "0",
         "false",
         "no",
         "off",
     }
+
+
+def set_trace_enabled(enabled: bool) -> None:
+    global _trace_enabled_override
+    _trace_enabled_override = enabled
+
+
+def get_trace_enabled() -> bool:
+    return is_trace_enabled()
 
 
 def ensure_trace_dir() -> None:
@@ -359,7 +373,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen TEXT NOT NULL,
     request_count INTEGER NOT NULL DEFAULT 0,
     cc_version TEXT,
-    cch TEXT
+    cch TEXT,
+    archived INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS requests (
@@ -489,6 +504,10 @@ def _conn() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     _CONN_LOCAL.conn = conn
     return conn
 
@@ -633,6 +652,22 @@ def _extract_title(response_text: str) -> Optional[str]:
         if line:
             return line[:120]
     return None
+
+
+def archive_session(session_id: str) -> bool:
+    c = _conn()
+    cur = c.execute(
+        "UPDATE sessions SET archived = 1 WHERE session_id = ?", (session_id,)
+    )
+    return cur.rowcount > 0
+
+
+def unarchive_session(session_id: str) -> bool:
+    c = _conn()
+    cur = c.execute(
+        "UPDATE sessions SET archived = 0 WHERE session_id = ?", (session_id,)
+    )
+    return cur.rowcount > 0
 
 
 def _upsert_session(c: sqlite3.Connection, session_id: Optional[str], started_at: str,
@@ -1261,10 +1296,11 @@ def _decode_jsons(data: Dict[str, Any], keys: Iterable[str]) -> None:
                 data[k.replace("_json", "")] = data[k]
 
 
-def list_sessions() -> List[Dict[str, Any]]:
+def list_sessions(include_archived: bool = False) -> List[Dict[str, Any]]:
     c = _conn()
+    where = "" if include_archived else "WHERE s.archived = 0"
     rows = c.execute(
-        """
+        f"""
         SELECT s.*,
                COUNT(r.trace_id) AS request_count_actual,
                SUM(CASE WHEN r.role_kind = 'main' THEN 1 ELSE 0 END) AS main_requests,
@@ -1274,6 +1310,7 @@ def list_sessions() -> List[Dict[str, Any]]:
                MIN(r.model_mapped) AS sample_model_mapped
         FROM sessions s
         LEFT JOIN requests r ON r.session_id = s.session_id
+        {where}
         GROUP BY s.session_id
         ORDER BY s.last_seen DESC
         """

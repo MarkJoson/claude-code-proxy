@@ -104,6 +104,20 @@
   .session-item .sid { font-family: ui-monospace, monospace; font-size: 11px; color: var(--text-dim); }
   .session-item .stitle { font-size: 13px; margin: 4px 0; color: var(--text); }
   .session-item .smeta { font-size: 11px; color: var(--text-faint); }
+  .session-item .archive-btn {
+    float: right;
+    background: none;
+    border: 1px solid var(--line-2);
+    color: var(--text-faint);
+    border-radius: 3px;
+    padding: 2px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    visibility: hidden;
+    margin-left: 6px;
+  }
+  .session-item:hover .archive-btn { visibility: visible; }
+  .session-item .archive-btn:hover { color: var(--warn); border-color: var(--warn); }
 
   /* Middle: tabs */
   .tabs {
@@ -710,6 +724,7 @@ function renderSessionList() {
         ${escapeHtml(fmtDate(s.first_seen))} · cc ${escapeHtml(s.cc_version || '?')}<br/>
         ${s.main_requests || 0}M · ${s.subagent_requests || 0}S · ${s.titler_requests || 0}T · ${s.token_requests || 0}tok
       </div>
+      <button class="archive-btn" data-archive-session-id="${escapeHtml(s.session_id)}" title="归档（不在列表中显示，数据保留）">归档</button>
     </div>`;
   }).join('');
 }
@@ -1832,6 +1847,14 @@ function renderToolEventDetail(e) {
 // Events
 // -------------------------------------------------------------
 document.addEventListener('click', async (event) => {
+  const archiveBtn = event.target.closest('[data-archive-session-id]');
+  if (archiveBtn) {
+    event.stopPropagation();
+    const sid = archiveBtn.dataset.archiveSessionId;
+    await fetch(`/api/v2/sessions/${encodeURIComponent(sid)}/archive`, { method: 'POST' });
+    await loadSessions();
+    return;
+  }
   const sess = event.target.closest('[data-session-id]');
   if (sess) {
     await selectSession(sess.dataset.sessionId);

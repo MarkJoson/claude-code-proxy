@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from trace_db import (
+    archive_session,
     build_agent_tree,
     build_history_chains,
     build_prefix_trie,
@@ -28,6 +29,7 @@ from trace_db import (
     get_request,
     get_session,
     get_tool_event,
+    get_trace_enabled,
     headers_to_trace,
     list_requests,
     list_sessions,
@@ -37,7 +39,9 @@ from trace_db import (
     record_request_completed as trace_request_completed,
     record_request_failed as trace_request_failed,
     record_request_started as trace_request_started,
+    set_trace_enabled,
     snapshot_stats,
+    unarchive_session,
 )
 
 import litellm
@@ -2067,8 +2071,8 @@ async def api_stats():
     return snapshot_stats()
 
 @app.get("/api/v2/sessions")
-async def api_list_sessions():
-    return {"sessions": list_sessions(), "stats": snapshot_stats()}
+async def api_list_sessions(include_archived: bool = False):
+    return {"sessions": list_sessions(include_archived=include_archived), "stats": snapshot_stats()}
 
 @app.get("/api/v2/sessions/{session_id}")
 async def api_get_session(session_id: str):
@@ -2076,6 +2080,22 @@ async def api_get_session(session_id: str):
     if sess is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return sess
+
+
+@app.post("/api/v2/sessions/{session_id}/archive")
+async def api_archive_session(session_id: str):
+    ok = archive_session(session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"ok": True, "session_id": session_id, "archived": True}
+
+
+@app.post("/api/v2/sessions/{session_id}/unarchive")
+async def api_unarchive_session(session_id: str):
+    ok = unarchive_session(session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"ok": True, "session_id": session_id, "archived": False}
 
 @app.get("/api/v2/sessions/{session_id}/timeline")
 async def api_session_timeline(session_id: str):
@@ -2128,6 +2148,18 @@ async def api_get_agent_call(agent_call_id: str):
     if call is None:
         raise HTTPException(status_code=404, detail="Agent call not found")
     return call
+
+@app.get("/api/v2/trace/enabled")
+async def api_get_trace_enabled():
+    return {"enabled": get_trace_enabled()}
+
+
+@app.post("/api/v2/trace/enabled")
+async def api_set_trace_enabled(body: Dict[str, Any]):
+    enabled = bool(body.get("enabled", True))
+    set_trace_enabled(enabled)
+    return {"enabled": get_trace_enabled()}
+
 
 @app.delete("/api/v2/traces")
 async def api_clear_traces():
