@@ -824,6 +824,162 @@ def rule_overridden_write(messages: List[Dict[str, Any]], steps: List[Dict[str, 
     return n_dropped
 
 
+# ---------------------------------------------------------------------------
+# JSON-input adapter: load one or more exported-DB JSON dumps into an
+# in-memory SQLite so the rest of the pipeline runs unchanged.
+# ---------------------------------------------------------------------------
+
+_MEM_SCHEMA = """
+CREATE TABLE sessions (
+    session_id TEXT PRIMARY KEY,
+    origin TEXT, first_seen TEXT, last_seen TEXT,
+    request_count INTEGER, cc_version TEXT, cch TEXT
+);
+CREATE TABLE requests (
+    trace_id TEXT PRIMARY KEY,
+    session_id TEXT, api TEXT, role_kind TEXT, agent_label TEXT,
+    model_requested TEXT, model_mapped TEXT,
+    started_at TEXT, started_ms INTEGER,
+    completed_at TEXT, completed_ms INTEGER, duration_ms INTEGER,
+    status TEXT, status_code INTEGER,
+    message_count INTEGER,
+    prefix_hashes_json TEXT,
+    request_body_json TEXT, converted_request_json TEXT,
+    response_body_json TEXT, error_json TEXT,
+    response_stop_reason TEXT,
+    parent_trace_id TEXT, parent_agent_call_id TEXT,
+    title TEXT
+);
+CREATE INDEX idx_req_session ON requests(session_id, started_ms);
+CREATE TABLE agent_calls (
+    agent_call_id TEXT PRIMARY KEY,
+    session_id TEXT, parent_trace_id TEXT,
+    tool_use_id TEXT, tool_name TEXT, agent_label TEXT,
+    started_at TEXT, started_ms INTEGER,
+    completed_at TEXT, completed_ms INTEGER, duration_ms INTEGER,
+    status TEXT,
+    input_preview TEXT, result_preview TEXT, result_trace_id TEXT
+);
+CREATE INDEX idx_ac_session ON agent_calls(session_id, started_ms);
+"""
+
+
+def _to_json_str(v: Any) -> Optional[str]:
+    """Re-serialize dict/list back to JSON string for storage; pass through strings."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    try:
+        return json.dumps(v, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return json.dumps(str(v), ensure_ascii=False)
+
+
+_SESSION_COLS = ("session_id", "origin", "first_seen", "last_seen",
+                 "request_count", "cc_version", "cch")
+_REQ_COLS = (
+    "trace_id", "session_id", "api", "role_kind", "agent_label",
+    "model_requested", "model_mapped",
+    "started_at", "started_ms",
+    "completed_at", "completed_ms", "duration_ms",
+    "status", "status_code", "message_count",
+    "prefix_hashes_json", "request_body_json", "converted_request_json",
+    "response_body_json", "error_json",
+    "response_stop_reason",
+    "parent_trace_id", "parent_agent_call_id", "title",
+)
+_AC_COLS = (
+    "agent_call_id", "session_id", "parent_trace_id",
+    "tool_use_id", "tool_name", "agent_label",
+    "started_at", "started_ms", "completed_at", "completed_ms", "duration_ms",
+    "status", "input_preview", "result_preview", "result_trace_id",
+)
+_JSON_FIELDS_IN_REQ = {
+    "prefix_hashes_json", "request_body_json", "converted_request_json",
+    "response_body_json", "error_json",
+}
+
+
+def _ingest_json_payload(conn: sqlite3.Connection, payload: Any, src: str) -> int:
+    """Insert one exported JSON dump into the in-memory db. Returns
+    the number of sessions ingested from this payload."""
+    # Accept either {session, requests, agent_calls, ...} or a list of such.
+    if isinstance(payload, list):
+        return sum(_ingest_json_payload(conn, item, src) for item in payload)
+    if not isinstance(payload, dict):
+        return 0
+
+    sess = payload.get("session") or {}
+    if not isinstance(sess, dict) or not sess.get("session_id"):
+        print(f"  warning: {src} has no session_id, skipping", file=sys.stderr)
+        return 0
+
+    sess_row = tuple(sess.get(c) for c in _SESSION_COLS)
+    conn.execute(
+        f"INSERT OR REPLACE INTO sessions ({','.join(_SESSION_COLS)}) "
+        f"VALUES ({','.join('?' * len(_SESSION_COLS))})",
+        sess_row,
+    )
+
+    for r in payload.get("requests") or []:
+        if not isinstance(r, dict):
+            continue
+        row = []
+        for c in _REQ_COLS:
+            v = r.get(c)
+            if c in _JSON_FIELDS_IN_REQ:
+                v = _to_json_str(v)
+            row.append(v)
+        conn.execute(
+            f"INSERT OR REPLACE INTO requests ({','.join(_REQ_COLS)}) "
+            f"VALUES ({','.join('?' * len(_REQ_COLS))})",
+            tuple(row),
+        )
+
+    for ac in payload.get("agent_calls") or []:
+        if not isinstance(ac, dict):
+            continue
+        # Make sure session_id is set even if the dump omitted it on the row
+        ac_local = dict(ac)
+        ac_local.setdefault("session_id", sess.get("session_id"))
+        row = tuple(ac_local.get(c) for c in _AC_COLS)
+        conn.execute(
+            f"INSERT OR REPLACE INTO agent_calls ({','.join(_AC_COLS)}) "
+            f"VALUES ({','.join('?' * len(_AC_COLS))})",
+            row,
+        )
+    return 1
+
+
+def load_json_input(input_path: Path) -> sqlite3.Connection:
+    """Build a temporary in-memory SQLite db from one JSON file or a directory
+    of JSON files (one exported session per file)."""
+    if input_path.is_dir():
+        paths = sorted(input_path.glob("*.json"))
+        if not paths:
+            raise FileNotFoundError(f"no *.json files found in {input_path}")
+    else:
+        paths = [input_path]
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_MEM_SCHEMA)
+
+    total = 0
+    for p in paths:
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"  warning: skipping {p} ({e})", file=sys.stderr)
+            continue
+        total += _ingest_json_payload(conn, payload, str(p))
+    conn.commit()
+    print(f"loaded {total} session(s) from {input_path} into in-memory db")
+    return conn
+
+
 RULE_FUNCS = {
     "failed_retry": rule_failed_retry,
     "dedupe_read": rule_dedupe_read,
@@ -867,7 +1023,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", default="cc_traces/trace.db",
-                        help="Path to trace.db (default: cc_traces/trace.db)")
+                        help="Input: a trace.db SQLite file, OR an exported JSON dump "
+                             "({session, requests, agent_calls, ...}), OR a directory of "
+                             "such JSON files (one per session). Auto-detected by suffix.")
     parser.add_argument("--out", default="exports/training",
                         help="Output directory (default: exports/training)")
     parser.add_argument("--session", action="append",
@@ -900,8 +1058,15 @@ def main() -> int:
 
     enabled_rules = [r for r in ALL_RULES if getattr(args, f"rule_{r}")]
 
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+    is_json_input = (
+        db_path.is_dir() or
+        db_path.suffix.lower() in (".json", ".jsonl")
+    )
+    if is_json_input:
+        conn = load_json_input(db_path)
+    else:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
 
     session_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
     has_archived = "archived" in session_cols
