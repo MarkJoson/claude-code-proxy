@@ -438,8 +438,19 @@ def build_subagent_trajectories(
     conn: sqlite3.Connection, session_row: sqlite3.Row
 ) -> List[Tuple[str, str, Dict[str, Any]]]:
     """Return [(agent_call_id, subagent_type, bundle), ...] for every Agent/Task
-    invocation in this session. Each bundle is built from the subagent's own
-    request stream, grouped by parent_agent_call_id."""
+    invocation in this session.
+
+    Handles three historical data shapes:
+      new-style  — all child requests carry parent_agent_call_id (current trace code)
+      old-style  — only the first child request carries parent_agent_call_id; the rest
+                   chain via parent_trace_id but the 1→2 link is missing (tracing bug)
+      legacy-export — agent_calls table absent; all requests share one parent_agent_call_id
+
+    Partitioning strategy: use each agent_call's "seed start time" (min started_ms of
+    directly-linked requests) as a time boundary.  All subagent requests from that time
+    up to the next seed time belong to this agent_call.  This survives broken
+    parent_trace_id chains because it doesn't depend on link completeness.
+    """
     sid = session_row["session_id"]
     acs = conn.execute(
         """
@@ -450,25 +461,64 @@ def build_subagent_trajectories(
         """,
         (sid,),
     ).fetchall()
-    if not acs:
-        return []
 
-    out: List[Tuple[str, str, Dict[str, Any]]] = []
-    for ac in acs:
-        rows = conn.execute(
-            f"""
-            {_TRAJECTORY_SELECT}
+    # Fallback: agent_calls table absent — synthesize from distinct parent_agent_call_id
+    if not acs:
+        synthetic = conn.execute(
+            """
+            SELECT parent_agent_call_id AS agent_call_id, agent_label,
+                   MIN(started_ms) AS started_ms
             FROM requests
             WHERE session_id = ? AND role_kind = 'subagent'
-              AND parent_agent_call_id = ? AND api = 'messages'
+              AND parent_agent_call_id IS NOT NULL
+            GROUP BY parent_agent_call_id
             ORDER BY started_ms ASC
             """,
-            (sid, ac["agent_call_id"]),
+            (sid,),
         ).fetchall()
+        if not synthetic:
+            return []
+        acs = [{"agent_call_id": r["agent_call_id"], "agent_label": r["agent_label"],
+                "tool_name": "Agent", "started_ms": r["started_ms"],
+                "status": "unknown", "input_preview": None}
+               for r in synthetic]
+
+    # Seed start time for each agent_call = min started_ms of directly-linked requests
+    seed_starts: List[Optional[int]] = []
+    for ac in acs:
+        row = conn.execute(
+            "SELECT MIN(started_ms) FROM requests "
+            "WHERE session_id = ? AND parent_agent_call_id = ? AND api = 'messages'",
+            (sid, ac["agent_call_id"]),
+        ).fetchone()
+        seed_starts.append(row[0] if row else None)
+
+    # All subagent requests for this session, sorted chronologically
+    all_rows = conn.execute(
+        f"""
+        {_TRAJECTORY_SELECT}
+        FROM requests
+        WHERE session_id = ? AND role_kind = 'subagent' AND api = 'messages'
+        ORDER BY started_ms ASC
+        """,
+        (sid,),
+    ).fetchall()
+
+    out: List[Tuple[str, str, Dict[str, Any]]] = []
+    for i, ac in enumerate(acs):
+        t_start = seed_starts[i]
+        if t_start is None:
+            continue
+        t_end = next((seed_starts[j] for j in range(i + 1, len(acs))
+                      if seed_starts[j] is not None), None)
+        rows = [r for r in all_rows
+                if r["started_ms"] is not None
+                and r["started_ms"] >= t_start
+                and (t_end is None or r["started_ms"] < t_end)]
         if not rows:
             continue
         bundle = _build_trajectory_from_rows(
-            list(rows),
+            rows,
             session_row,
             "subagent",
             extra_meta={
