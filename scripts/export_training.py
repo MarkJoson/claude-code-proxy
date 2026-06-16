@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import re
 import sqlite3
@@ -483,7 +484,10 @@ def build_subagent_trajectories(
                 "status": "unknown", "input_preview": None}
                for r in synthetic]
 
-    # Seed start time for each agent_call = min started_ms of directly-linked requests
+    # Seed start time for each agent_call = min started_ms of directly-linked requests.
+    # If no requests carry parent_agent_call_id (very old dumps), fall back to the
+    # agent_call's own started_ms — the earliest subagent request is the next thing
+    # that fires after the Agent tool_use, so this is still a valid lower bound.
     seed_starts: List[Optional[int]] = []
     for ac in acs:
         row = conn.execute(
@@ -491,7 +495,10 @@ def build_subagent_trajectories(
             "WHERE session_id = ? AND parent_agent_call_id = ? AND api = 'messages'",
             (sid, ac["agent_call_id"]),
         ).fetchone()
-        seed_starts.append(row[0] if row else None)
+        t = row[0] if row else None
+        if t is None:
+            t = ac["started_ms"]
+        seed_starts.append(t)
 
     # All subagent requests for this session, sorted chronologically
     all_rows = conn.execute(
@@ -951,6 +958,67 @@ _JSON_FIELDS_IN_REQ = {
 }
 
 
+def _synthesize_agent_calls_from_tool_events(
+    payload: Dict[str, Any], session_id: str
+) -> List[Dict[str, Any]]:
+    """For exports where agent_calls is empty but tool_events is populated,
+    rebuild agent_call rows from Agent/Task tool_use_history events.  This is
+    the fallback path for legacy dumps that predate the agent_calls resolver.
+
+    Note: tool_use_history.event_time is the timestamp of the main-thread request
+    that *carried* the tool_use block in its history, which can be much later than
+    the actual subagent run.  We therefore back-fill started_ms from the earliest
+    subagent request in the session, partitioning across multiple Agent calls by
+    sorting both lists chronologically and pairing in order.
+    """
+    sub_starts = sorted(
+        r.get("started_ms") for r in (payload.get("requests") or [])
+        if isinstance(r, dict) and r.get("role_kind") == "subagent"
+        and r.get("started_ms") is not None
+    )
+    agent_events = [
+        te for te in (payload.get("tool_events") or [])
+        if isinstance(te, dict)
+        and te.get("event_type") == "tool_use_history"
+        and (te.get("tool_name") or "").lower() in ("agent", "task")
+        and te.get("tool_use_id")
+    ]
+    agent_events.sort(key=lambda e: e.get("event_time_ms") or 0)
+
+    out = []
+    for idx, te in enumerate(agent_events):
+        tu_id = te["tool_use_id"]
+        seed = f"{te.get('trace_id') or ''}|{tu_id}"
+        agent_call_id = hashlib.md5(seed.encode("utf-8")).hexdigest()[:20]
+        # Each Agent call gets the next "block" of subagent requests, partitioned
+        # by index.  When there's only one Agent call, all subagent starts go to it.
+        if len(agent_events) == 1:
+            inferred_start = sub_starts[0] if sub_starts else te.get("event_time_ms")
+        else:
+            block_size = max(1, len(sub_starts) // len(agent_events))
+            block_idx = idx * block_size
+            inferred_start = (sub_starts[block_idx] if block_idx < len(sub_starts)
+                              else te.get("event_time_ms"))
+        out.append({
+            "agent_call_id": agent_call_id,
+            "session_id": session_id,
+            "parent_trace_id": te.get("trace_id"),
+            "tool_use_id": tu_id,
+            "tool_name": te.get("tool_name"),
+            "agent_label": te.get("agent_label"),
+            "started_at": te.get("event_time"),
+            "started_ms": inferred_start,
+            "completed_at": None,
+            "completed_ms": None,
+            "duration_ms": None,
+            "status": "unknown",
+            "input_preview": te.get("input_preview"),
+            "result_preview": None,
+            "result_trace_id": None,
+        })
+    return out
+
+
 def _ingest_json_payload(conn: sqlite3.Connection, payload: Any, src: str) -> int:
     """Insert one exported JSON dump into the in-memory db. Returns
     the number of sessions ingested from this payload."""
@@ -987,7 +1055,15 @@ def _ingest_json_payload(conn: sqlite3.Connection, payload: Any, src: str) -> in
             tuple(row),
         )
 
-    for ac in payload.get("agent_calls") or []:
+    acs = payload.get("agent_calls") or []
+    if not acs and (payload.get("tool_events") or []):
+        synth = _synthesize_agent_calls_from_tool_events(payload, sess.get("session_id"))
+        if synth:
+            print(f"  note: {src} had no agent_calls; synthesized {len(synth)} from tool_events",
+                  file=sys.stderr)
+            acs = synth
+
+    for ac in acs:
         if not isinstance(ac, dict):
             continue
         # Make sure session_id is set even if the dump omitted it on the row
