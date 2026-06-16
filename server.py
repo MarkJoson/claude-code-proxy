@@ -1736,6 +1736,7 @@ async def _stream_anthropic_passthrough(
     """Async generator: stream raw SSE bytes from upstream Anthropic API."""
     accumulated_text_chunks: List[str] = []
     upstream_status = 200
+    sse_buffer = ""  # cross-chunk buffer for SSE parsing
 
     # Reconstruct the final response from SSE events for trace recording
     reconstructed_response: Dict[str, Any] = {
@@ -1773,61 +1774,79 @@ async def _stream_anthropic_passthrough(
                         chunk_text = chunk.decode("utf-8", errors="replace")
                         accumulated_text_chunks.append(chunk_text)
 
-                        # Parse SSE events to reconstruct response
-                        for line in chunk_text.split("\n"):
-                            if line.startswith("data: "):
-                                data_str = line[6:].strip()
-                                if data_str and data_str != "[DONE]":
-                                    try:
-                                        event = json.loads(data_str)
-                                        event_type = event.get("type")
+                        # Parse SSE events with a cross-chunk buffer. Events are
+                        # separated by a blank line ("\n\n"); a single event may
+                        # span multiple network chunks, so we cannot split each
+                        # chunk in isolation.
+                        sse_buffer += chunk_text
+                        while True:
+                            sep = sse_buffer.find("\n\n")
+                            if sep < 0:
+                                break
+                            raw_event = sse_buffer[:sep]
+                            sse_buffer = sse_buffer[sep + 2:]
+                            data_lines = []
+                            for ln in raw_event.split("\n"):
+                                if ln.startswith("data:"):
+                                    # SSE spec allows "data:foo" or "data: foo"
+                                    payload = ln[5:]
+                                    if payload.startswith(" "):
+                                        payload = payload[1:]
+                                    data_lines.append(payload)
+                            if not data_lines:
+                                continue
+                            data_str = "\n".join(data_lines).strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            try:
+                                event = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+                            event_type = event.get("type")
 
-                                        if event_type == "message_start":
-                                            msg = event.get("message", {})
-                                            reconstructed_response["id"] = msg.get("id")
-                                            reconstructed_response["model"] = msg.get("model")
-                                            reconstructed_response["usage"] = msg.get("usage", reconstructed_response["usage"])
+                            if event_type == "message_start":
+                                msg = event.get("message", {})
+                                reconstructed_response["id"] = msg.get("id")
+                                reconstructed_response["model"] = msg.get("model")
+                                reconstructed_response["usage"] = msg.get("usage", reconstructed_response["usage"])
 
-                                        elif event_type == "content_block_start":
-                                            content_block = event.get("content_block", {})
-                                            # For tool_use blocks, initialize input as empty string
-                                            # since we'll accumulate JSON deltas
-                                            if content_block.get("type") == "tool_use" and "input" in content_block:
-                                                content_block["input"] = ""
-                                            reconstructed_response["content"].append(content_block)
+                            elif event_type == "content_block_start":
+                                content_block = event.get("content_block", {})
+                                # For tool_use blocks, initialize input as empty string
+                                # since we'll accumulate JSON deltas
+                                if content_block.get("type") == "tool_use" and "input" in content_block:
+                                    content_block["input"] = ""
+                                reconstructed_response["content"].append(content_block)
 
-                                        elif event_type == "content_block_delta":
-                                            delta = event.get("delta", {})
-                                            index = event.get("index", 0)
-                                            if index < len(reconstructed_response["content"]):
-                                                block = reconstructed_response["content"][index]
-                                                if delta.get("type") == "text_delta":
-                                                    if "text" not in block:
-                                                        block["text"] = ""
-                                                    block["text"] += delta.get("text", "")
-                                                elif delta.get("type") == "thinking_delta":
-                                                    if "thinking" not in block:
-                                                        block["thinking"] = ""
-                                                    block["thinking"] += delta.get("thinking", "")
-                                                elif delta.get("type") == "input_json_delta":
-                                                    if "input" not in block:
-                                                        block["input"] = ""
-                                                    elif not isinstance(block["input"], str):
-                                                        block["input"] = ""
-                                                    block["input"] += delta.get("partial_json", "")
+                            elif event_type == "content_block_delta":
+                                delta = event.get("delta", {})
+                                index = event.get("index", 0)
+                                if index < len(reconstructed_response["content"]):
+                                    block = reconstructed_response["content"][index]
+                                    if delta.get("type") == "text_delta":
+                                        if "text" not in block:
+                                            block["text"] = ""
+                                        block["text"] += delta.get("text", "")
+                                    elif delta.get("type") == "thinking_delta":
+                                        if "thinking" not in block:
+                                            block["thinking"] = ""
+                                        block["thinking"] += delta.get("thinking", "")
+                                    elif delta.get("type") == "input_json_delta":
+                                        if "input" not in block:
+                                            block["input"] = ""
+                                        elif not isinstance(block["input"], str):
+                                            block["input"] = ""
+                                        block["input"] += delta.get("partial_json", "")
 
-                                        elif event_type == "message_delta":
-                                            delta = event.get("delta", {})
-                                            if "stop_reason" in delta:
-                                                reconstructed_response["stop_reason"] = delta["stop_reason"]
-                                            if "stop_sequence" in delta:
-                                                reconstructed_response["stop_sequence"] = delta["stop_sequence"]
-                                            usage = event.get("usage", {})
-                                            if usage:
-                                                reconstructed_response["usage"]["output_tokens"] = usage.get("output_tokens", 0)
-
-                                    except json.JSONDecodeError:
-                                        pass
+                            elif event_type == "message_delta":
+                                delta = event.get("delta", {})
+                                if "stop_reason" in delta:
+                                    reconstructed_response["stop_reason"] = delta["stop_reason"]
+                                if "stop_sequence" in delta:
+                                    reconstructed_response["stop_sequence"] = delta["stop_sequence"]
+                                usage = event.get("usage", {})
+                                if usage:
+                                    reconstructed_response["usage"]["output_tokens"] = usage.get("output_tokens", 0)
 
                         yield chunk
     except Exception as exc:
@@ -1840,6 +1859,21 @@ async def _stream_anthropic_passthrough(
         upstream_status = 500
     finally:
         try:
+            # DEBUG: dump raw SSE for the latest passthrough request so we can
+            # see exactly what the upstream returned. Remove once root-caused.
+            try:
+                from pathlib import Path as _P
+                _dump = _P(__file__).parent / "cc_traces" / "last_sse.txt"
+                _dump.parent.mkdir(parents=True, exist_ok=True)
+                _dump.write_text(
+                    f"trace_id={trace_id}\nupstream_status={upstream_status}\n"
+                    f"chunks={len(accumulated_text_chunks)}\n"
+                    f"=== RAW SSE ===\n" + "".join(accumulated_text_chunks),
+                    encoding="utf-8",
+                )
+            except Exception as _dump_err:
+                logger.error(f"SSE dump failed: {_dump_err}")
+
             # Parse tool_use blocks' input from accumulated JSON strings
             for block in reconstructed_response.get("content", []):
                 if block.get("type") == "tool_use" and isinstance(block.get("input"), str):
