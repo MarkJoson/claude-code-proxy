@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 from trace_db import (
+    DB_PATH,
     archive_session,
     build_agent_tree,
     build_history_chains,
@@ -2214,11 +2215,10 @@ async def api_clear_traces():
 @app.get("/api/v2/trace/download")
 async def api_download_trace():
     """Download the raw trace.db file."""
-    db_path = trace_db.DB_PATH
-    if not db_path.exists():
+    if not DB_PATH.exists():
         raise HTTPException(status_code=404, detail="Trace database not found")
     return FileResponse(
-        path=str(db_path),
+        path=str(DB_PATH),
         media_type="application/octet-stream",
         filename="trace.db",
         headers={"Content-Disposition": "attachment; filename=\"trace.db\""},
@@ -2239,7 +2239,7 @@ async def _export_and_zip(
     try:
         cmd = [
             sys.executable, str(EXPORT_TRAINING_SCRIPT),
-            "--db", str(trace_db.DB_PATH),
+            "--db", str(DB_PATH),
             "--out", tmpdir,
             "--name-by", "session_id",
         ]
