@@ -435,6 +435,74 @@ def build_raw_trajectory(conn: sqlite3.Connection, session_row: sqlite3.Row) -> 
     return _build_trajectory_from_rows(list(rows), session_row, "main")
 
 
+def _synthesize_agent_calls_from_db_tool_events(
+    conn: sqlite3.Connection, session_id: str
+) -> List[Dict[str, Any]]:
+    """DB version of _synthesize_agent_calls_from_tool_events.
+
+    For old trace.db files where the agent_calls table is empty but tool_events
+    is populated, rebuild agent_call rows from Agent/Task tool_use_history events.
+    This mirrors the JSON-path fallback so that old DB exports get subagent
+    trajectories too.
+    """
+    # Check whether tool_events table exists (very old DBs may not have it)
+    cols = {
+        row[0] for row in
+        conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    if "tool_events" not in cols:
+        return []
+
+    sub_starts = [
+        r["started_ms"] for r in
+        conn.execute(
+            "SELECT started_ms FROM requests "
+            "WHERE session_id = ? AND role_kind = 'subagent' AND api = 'messages' "
+            "ORDER BY started_ms ASC",
+            (session_id,),
+        ).fetchall()
+        if r["started_ms"] is not None
+    ]
+
+    agent_events = conn.execute(
+        """
+        SELECT trace_id, tool_use_id, tool_name, agent_label,
+               event_time, event_time_ms, input_preview
+        FROM tool_events
+        WHERE session_id = ? AND event_type = 'tool_use_history'
+          AND tool_name IN ('Agent', 'Task')
+          AND tool_use_id IS NOT NULL
+        ORDER BY event_time_ms ASC
+        """,
+        (session_id,),
+    ).fetchall()
+
+    if not agent_events:
+        return []
+
+    out = []
+    for idx, te in enumerate(agent_events):
+        tu_id = te["tool_use_id"]
+        seed = f"{te['trace_id'] or ''}|{tu_id}"
+        agent_call_id = hashlib.md5(seed.encode("utf-8")).hexdigest()[:20]
+        if len(agent_events) == 1:
+            inferred_start = sub_starts[0] if sub_starts else te["event_time_ms"]
+        else:
+            block_size = max(1, len(sub_starts) // len(agent_events))
+            block_idx = idx * block_size
+            inferred_start = (sub_starts[block_idx] if block_idx < len(sub_starts)
+                              else te["event_time_ms"])
+        out.append({
+            "agent_call_id": agent_call_id,
+            "agent_label": te["agent_label"],
+            "tool_name": te["tool_name"],
+            "started_ms": inferred_start,
+            "status": "unknown",
+            "input_preview": te["input_preview"],
+        })
+    return out
+
+
 def build_subagent_trajectories(
     conn: sqlite3.Connection, session_row: sqlite3.Row
 ) -> List[Tuple[str, str, Dict[str, Any]]]:
@@ -478,11 +546,14 @@ def build_subagent_trajectories(
             (sid,),
         ).fetchall()
         if not synthetic:
-            return []
-        acs = [{"agent_call_id": r["agent_call_id"], "agent_label": r["agent_label"],
-                "tool_name": "Agent", "started_ms": r["started_ms"],
-                "status": "unknown", "input_preview": None}
-               for r in synthetic]
+            # Third fallback: synthesize from tool_events (old DBs that predate
+            # both agent_calls table AND parent_agent_call_id on subagent requests)
+            acs = _synthesize_agent_calls_from_db_tool_events(conn, sid)
+        else:
+            acs = [{"agent_call_id": r["agent_call_id"], "agent_label": r["agent_label"],
+                    "tool_name": "Agent", "started_ms": r["started_ms"],
+                    "status": "unknown", "input_preview": None}
+                   for r in synthetic]
 
     # Seed start time for each agent_call = min started_ms of directly-linked requests.
     # If no requests carry parent_agent_call_id (very old dumps), fall back to the

@@ -2241,7 +2241,6 @@ async def _export_and_zip(
             sys.executable, str(EXPORT_TRAINING_SCRIPT),
             "--db", str(DB_PATH),
             "--out", tmpdir,
-            "--name-by", "session_id",
         ]
         if session_id:
             cmd.extend(["--session", session_id])
