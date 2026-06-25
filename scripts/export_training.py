@@ -243,7 +243,7 @@ def anthropic_message_to_openai(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
             parts.append("<think>\n" + "\n".join(thinking_parts).strip() + "\n</think>")
         if text_parts:
             parts.append("\n".join(text_parts).strip())
-        content_str = "\n\n".join(p for p in parts if p) or None
+        content_str = "\n\n".join(p for p in parts if p) or ""
 
         out_msg: Dict[str, Any] = {"role": "assistant", "content": content_str}
         if tool_calls:

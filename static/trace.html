@@ -119,6 +119,21 @@
   .session-item:hover .archive-btn { visibility: visible; }
   .session-item .archive-btn:hover { color: var(--warn); border-color: var(--warn); }
 
+  .session-item .export-btn {
+    float: right;
+    background: none;
+    border: 1px solid var(--line-2);
+    color: var(--text-faint);
+    border-radius: 3px;
+    padding: 2px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    visibility: hidden;
+    margin-left: 6px;
+  }
+  .session-item:hover .export-btn { visibility: visible; }
+  .session-item .export-btn:hover { color: var(--accent); border-color: var(--accent); }
+
   /* Middle: tabs */
   .tabs {
     display: flex; border-bottom: 1px solid var(--line);
@@ -578,6 +593,8 @@
     <button id="traceToggle" type="button">轨迹: ?</button>
     <button id="refresh" type="button">刷新</button>
     <button id="clear" type="button">清空</button>
+    <button id="exportTraining" type="button" title="导出所有会话的 OpenAI 训练数据">导出训练数据</button>
+    <button id="downloadDb" type="button" title="下载 trace.db 数据库文件">下载 DB</button>
   </div>
 </header>
 <div class="stats" id="statsBar"></div>
@@ -726,6 +743,7 @@ function renderSessionList() {
         ${s.main_requests || 0}M · ${s.subagent_requests || 0}S · ${s.titler_requests || 0}T · ${s.token_requests || 0}tok
       </div>
       <button class="archive-btn" data-archive-session-id="${escapeHtml(s.session_id)}" title="归档（不在列表中显示，数据保留）">归档</button>
+      <button class="export-btn" data-export-session-id="${escapeHtml(s.session_id)}" title="导出该会话的训练数据">导出</button>
     </div>`;
   }).join('');
 }
@@ -1856,6 +1874,16 @@ document.addEventListener('click', async (event) => {
     await loadSessions();
     return;
   }
+  const exportBtn = event.target.closest('[data-export-session-id]');
+  if (exportBtn) {
+    event.stopPropagation();
+    const sid = exportBtn.dataset.exportSessionId;
+    const a = document.createElement('a');
+    a.href = `/api/v2/sessions/${encodeURIComponent(sid)}/export/training`;
+    a.download = `session_${sid.slice(0, 8)}_export.zip`;
+    a.click();
+    return;
+  }
   const sess = event.target.closest('[data-session-id]');
   if (sess) {
     await selectSession(sess.dataset.sessionId);
@@ -1896,6 +1924,18 @@ $('clear').addEventListener('click', async () => {
   if (!confirm('清空全部 trace 记录？')) return;
   await fetch('/api/v2/traces', { method: 'DELETE' });
   await loadSessions();
+});
+$('exportTraining').addEventListener('click', () => {
+  const a = document.createElement('a');
+  a.href = '/api/v2/export/training';
+  a.download = 'training_export.zip';
+  a.click();
+});
+$('downloadDb').addEventListener('click', () => {
+  const a = document.createElement('a');
+  a.href = '/api/v2/trace/download';
+  a.download = 'trace.db';
+  a.click();
 });
 $('autoRefresh').addEventListener('click', () => {
   state.autoRefresh = !state.autoRefresh;

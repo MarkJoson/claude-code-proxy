@@ -81,7 +81,7 @@ def _anthropic_response_to_openai(response: Optional[Dict[str, Any]]) -> Optiona
             )
 
     message: Dict[str, Any] = {"role": "assistant"}
-    message["content"] = "\n".join(text_parts) if text_parts else None
+    message["content"] = "\n".join(text_parts) if text_parts else ""
     if tool_calls:
         message["tool_calls"] = tool_calls
 

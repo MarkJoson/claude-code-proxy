@@ -7,6 +7,9 @@ from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
 import asyncio
+import io
+import tempfile
+import zipfile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 import litellm
 import uuid
@@ -43,6 +46,9 @@ from trace_db import (
     snapshot_stats,
     unarchive_session,
 )
+
+SCRIPTS_DIR = Path(__file__).parent / "scripts"
+EXPORT_TRAINING_SCRIPT = SCRIPTS_DIR / "export_training.py"
 
 import litellm
 litellm.ssl_verify = False
@@ -2199,6 +2205,140 @@ async def api_set_trace_enabled(body: Dict[str, Any]):
 async def api_clear_traces():
     clear_traces()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Export endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v2/trace/download")
+async def api_download_trace():
+    """Download the raw trace.db file."""
+    db_path = trace_db.DB_PATH
+    if not db_path.exists():
+        raise HTTPException(status_code=404, detail="Trace database not found")
+    return FileResponse(
+        path=str(db_path),
+        media_type="application/octet-stream",
+        filename="trace.db",
+        headers={"Content-Disposition": "attachment; filename=\"trace.db\""},
+    )
+
+
+async def _export_and_zip(
+    session_id: Optional[str] = None,
+    raw_only: bool = False,
+    include_subagents: bool = False,
+    include_archived: bool = False,
+    timeout: int = 120,
+) -> io.BytesIO:
+    """Run export_training.py into a temp dir and return an in-memory zip."""
+    import shutil
+
+    tmpdir = tempfile.mkdtemp(prefix="export_training_")
+    try:
+        cmd = [
+            sys.executable, str(EXPORT_TRAINING_SCRIPT),
+            "--db", str(trace_db.DB_PATH),
+            "--out", tmpdir,
+            "--name-by", "session_id",
+        ]
+        if session_id:
+            cmd.extend(["--session", session_id])
+        if raw_only:
+            cmd.append("--raw-only")
+        if include_subagents:
+            cmd.append("--export-subagents")
+        if include_archived:
+            cmd.append("--include-archived")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Export timed out after {timeout}s",
+            )
+
+        if proc.returncode != 0:
+            err_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+            raise HTTPException(
+                status_code=500,
+                detail=f"Export failed (exit {proc.returncode}): {err_text[:1000]}",
+            )
+
+        output_files = sorted(Path(tmpdir).glob("*"))
+        if not output_files:
+            raise HTTPException(
+                status_code=404,
+                detail="No output generated (session may have no main-thread data)",
+            )
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fp in output_files:
+                if fp.is_file():
+                    zf.write(fp, fp.name)
+        buf.seek(0)
+        return buf
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@app.get("/api/v2/sessions/{session_id}/export/training")
+async def api_export_session_training(
+    session_id: str,
+    raw_only: bool = False,
+):
+    """Export a single session's training data as a zip file."""
+    sess = get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    zip_buf = await _export_and_zip(
+        session_id=session_id,
+        raw_only=raw_only,
+        timeout=120,
+    )
+    short_id = session_id[:8]
+    return StreamingResponse(
+        iter([zip_buf.getvalue()]),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename=\"session_{short_id}_export.zip\"",
+        },
+    )
+
+
+@app.get("/api/v2/export/training")
+async def api_export_all_training(
+    raw_only: bool = False,
+    include_subagents: bool = False,
+    include_archived: bool = False,
+):
+    """Export all sessions' training data as a zip file."""
+    zip_buf = await _export_and_zip(
+        raw_only=raw_only,
+        include_subagents=include_subagents,
+        include_archived=include_archived,
+        timeout=300,
+    )
+    return StreamingResponse(
+        iter([zip_buf.getvalue()]),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": "attachment; filename=\"training_export.zip\"",
+        },
+    )
 
 # Define ANSI color codes for terminal output
 class Colors:
