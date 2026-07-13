@@ -702,6 +702,11 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         "stream": anthropic_request.stream,  # Respect client's stream preference
     }
 
+    # Ask OpenAI-compatible upstreams (vLLM, etc.) to include usage information
+    # in the final streaming chunk so we can record prefill/output token counts.
+    if anthropic_request.stream:
+        litellm_request["stream_options"] = {"include_usage": True}
+
     # Pass thinking through extra_body
     if anthropic_request.thinking:
         thinking_dict = anthropic_request.thinking
@@ -950,6 +955,50 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             model_info=None
         )
 
+
+def _build_perf_extra(
+    *,
+    trace_start: Optional[float],
+    first_token_ts: Optional[float],
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int,
+    streaming: bool = True,
+) -> Dict[str, Any]:
+    """Build the extra_json perf payload for a completed streaming request.
+
+    All timestamps are wall-clock (time.time()).  Metrics are best-effort: if
+    first_token_ts is missing (e.g. the stream contained no content), TTFT and
+    decode-stage metrics are omitted rather than crashing.
+    """
+    perf: Dict[str, Any] = {
+        "prefill_tokens": int(input_tokens),
+        "cached_tokens": int(cached_tokens),
+        "output_tokens": int(output_tokens),
+        "decode_tokens": int(output_tokens),
+    }
+
+    if trace_start is not None and first_token_ts is not None:
+        ttft_ms = max(0, int((first_token_ts - trace_start) * 1000))
+        perf["ttft_ms"] = ttft_ms
+        perf["prefill_ms"] = ttft_ms
+        if ttft_ms > 0 and input_tokens > 0:
+            perf["prefill_toks_per_sec"] = round(input_tokens / ttft_ms * 1000, 2)
+
+        completed_ts = time.time()
+        decode_ms = max(0, int((completed_ts - first_token_ts) * 1000))
+        perf["decode_ms"] = decode_ms
+
+        # TPOT denominator: output_tokens - 1 because the first output token is
+        # accounted for by TTFT.  Fallback to 1 to avoid division-by-zero.
+        tpot_denom = max(1, output_tokens - 1)
+        perf["tpot_ms"] = round(decode_ms / tpot_denom, 2)
+
+        if decode_ms > 0:
+            perf["decode_toks_per_sec"] = round(tpot_denom / decode_ms * 1000, 2)
+
+    return {"streaming": streaming, "perf": perf}
+
 async def handle_streaming(response_generator, original_request: MessagesRequest, trace_id=None, trace_start=None, litellm_request=None):
     """Handle streaming responses from LiteLLM and convert to Anthropic format."""
     accumulated_response = {
@@ -1027,7 +1076,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
         # Track tool calls for accumulated response
         tool_calls_map = {}  # {tool_id: {"name": str, "input": str}}
-        
+        first_token_ts: Optional[float] = None
+        cached_tokens = 0
+
         # Process each chunk
         async for chunk in response_generator:
             try:
@@ -1039,6 +1090,13 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         input_tokens = chunk.usage.prompt_tokens
                     if hasattr(chunk.usage, 'completion_tokens'):
                         output_tokens = chunk.usage.completion_tokens
+                    # vLLM / OpenAI returns cached tokens under prompt_tokens_details
+                    ptd = getattr(chunk.usage, 'prompt_tokens_details', None)
+                    if ptd is not None:
+                        if isinstance(ptd, dict):
+                            cached_tokens = ptd.get("cached_tokens") or 0
+                        elif hasattr(ptd, 'cached_tokens'):
+                            cached_tokens = ptd.cached_tokens or 0
                 
                 # Handle text content
                 if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
@@ -1065,6 +1123,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     
                     # Accumulate text content
                     if delta_content is not None and delta_content != "":
+                        if first_token_ts is None:
+                            first_token_ts = time.time()
                         accumulated_text += delta_content
                         
                         # Always emit text deltas if no tool calls started
@@ -1083,6 +1143,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     
                     # Process tool calls if any
                     if delta_tool_calls:
+                        if first_token_ts is None:
+                            first_token_ts = time.time()
                         # First tool call we've seen - need to handle text properly
                         if tool_index is None:
                             # If we've been streaming text, close that text block
@@ -1234,26 +1296,38 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         # Send final [DONE] marker to match Anthropic's behavior
                         yield "data: [DONE]\n\n"
 
-                        # Record trace completion (after streaming finishes)
-                        if trace_id and trace_start and litellm_request:
-                            try:
-                                trace_request_completed(
-                                    trace_id=trace_id,
-                                    status_code=200,
-                                    duration_ms=monotonic_ms(trace_start),
-                                    converted_request=litellm_request,
-                                    response=accumulated_response,
-                                    extra={"streaming": True},
-                                )
-                            except Exception as trace_err:
-                                logger.error(f"Failed to record streaming trace: {trace_err}")
-
-                        return
+                        # NOTE: we do NOT return here. OpenAI-compatible upstreams
+                        # (vLLM, etc.) send a final usage chunk after the
+                        # finish_reason when stream_options.include_usage is set.
+                        # Keep reading silently to capture it; trace recording
+                        # happens after the async-for loop.
             except Exception as e:
                 # Log error but continue processing other chunks
                 logger.error(f"Error processing chunk: {str(e)}")
                 continue
-        
+
+        # Record trace completion once streaming finishes. This runs both when
+        # we saw a finish_reason (after optionally capturing the trailing usage
+        # chunk) and when the loop ended without an explicit finish_reason.
+        if trace_id and trace_start and litellm_request:
+            try:
+                trace_request_completed(
+                    trace_id=trace_id,
+                    status_code=200,
+                    duration_ms=monotonic_ms(trace_start),
+                    converted_request=litellm_request,
+                    response=accumulated_response,
+                    extra=_build_perf_extra(
+                        trace_start=trace_start,
+                        first_token_ts=first_token_ts,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cached_tokens=cached_tokens,
+                    ),
+                )
+            except Exception as trace_err:
+                logger.error(f"Failed to record streaming trace: {trace_err}")
+
         # If we didn't get a finish reason, close any open blocks
         if not has_sent_stop_reason:
             # Close any open tool call blocks
@@ -1294,20 +1368,6 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
             # Send final [DONE] marker to match Anthropic's behavior
             yield "data: [DONE]\n\n"
-
-            # Record trace completion
-            if trace_id and trace_start and litellm_request:
-                try:
-                    trace_request_completed(
-                        trace_id=trace_id,
-                        status_code=200,
-                        duration_ms=monotonic_ms(trace_start),
-                        converted_request=litellm_request,
-                        response=accumulated_response,
-                        extra={"streaming": True},
-                    )
-                except Exception as trace_err:
-                    logger.error(f"Failed to record streaming trace: {trace_err}")
 
     except Exception as e:
         import traceback

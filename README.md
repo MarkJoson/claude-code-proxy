@@ -597,6 +597,53 @@ LiteLLM 在 Anthropic ↔ OpenAI 格式转换时，有些 Anthropic 特有功能
 - 启动参数 `--trace-disabled` 可以在启动时关闭追踪记录
 - 通过 API `DELETE /api/v2/traces` 或 UI 中的"清空"按钮可以清除所有记录
 
+### 性能指标采集
+
+当上游为 OpenAI 兼容端点（如 vLLM）且请求为流式时，Proxy 会自动记录每个 `/v1/messages` 请求的推理性能指标，写入 `requests.extra_json`：
+
+| 指标 | 字段 | 说明 |
+|------|------|------|
+| `prefill_tokens` | prompt 总 token 数 | 来自上游 usage 的 `prompt_tokens` |
+| `cached_tokens` | 前缀缓存命中 token 数 | 来自 `prompt_tokens_details.cached_tokens` |
+| `output_tokens` | 生成 token 总数 | 来自 `completion_tokens` |
+| `decode_tokens` | 同 `output_tokens` | 便于后续按 decode 阶段统计 |
+| `ttft_ms` | Time To First Token | 请求发出到首个内容 token 的毫秒数 |
+| `prefill_ms` | 同 `ttft_ms` | prefill 阶段 wall-clock 耗时 |
+| `prefill_toks_per_sec` | prefill 吞吐 | `prefill_tokens / prefill_ms * 1000` |
+| `decode_ms` | decode 阶段耗时 | 首 token 到末 token 的毫秒数 |
+| `tpot_ms` | Time Per Output Token | `decode_ms / (output_tokens - 1)` |
+| `decode_toks_per_sec` | decode 吞吐 | `(output_tokens - 1) / decode_ms * 1000` |
+
+导出与分析：
+
+```bash
+# 打印汇总
+python scripts/export_perf.py --db cc_traces/trace.db
+
+# 导出逐请求 JSONL / CSV
+python scripts/export_perf.py --db cc_traces/trace.db --output perf.jsonl --csv perf.csv
+
+# 导出逐任务统计 CSV（含 prefill/output 的 min/avg/max）
+python scripts/export_perf.py --db cc_traces/trace.db --tasks-csv tasks.csv
+
+# 生成交互式 HTML 看板（推荐）
+python scripts/export_dashboard.py --db cc_traces/trace.db --output perf_dashboard.html
+```
+
+`export_perf.py` 与 `export_dashboard.py` 同时兼容历史轨迹：没有 `extra_json.perf` 的记录会自动从 `response_usage_json` 提取 prefill/output 长度和缓存命中信息，TTFT/TPOT 等流式阶段指标会留空。
+
+HTML 看板特性：
+
+- 以「任务（task / session）」为核心：每个任务独立统计、独立查看，不会混在一起
+- 任务列表卡片：一眼看到每个任务的请求数、总耗时、**prefill/output 的 min/avg/max**、缓存命中率、平均 TTFT/TPOT
+- 点击任意任务进入单任务视图：TTFT vs prefill、TPOT 分布、该任务各轮次的 token/缓存/延迟曲线
+- 全局视图：所有任务的横向对比（总耗时、总 token、平均 TTFT/TPOT）
+- 完全离线：所有数据嵌入单个 HTML，用浏览器直接打开即可
+- 深色 / 浅色主题切换
+- 按任务、模型、role_kind 实时筛选
+- 模型对比卡片
+- 原始数据表格（前 500 条）
+
 ---
 
 ## 9. 代码结构速览
