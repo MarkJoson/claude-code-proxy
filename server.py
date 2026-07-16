@@ -539,6 +539,10 @@ def parse_tool_result_content(content):
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
                 result += item.get("text", "") + "\n"
+            elif isinstance(item, dict) and item.get("type") == "image":
+                # Keep base64 out of role=tool text. The same image is emitted
+                # separately as an OpenAI multimodal block below.
+                result += "[image returned directly to the model]\n"
             elif isinstance(item, str):
                 result += item + "\n"
             elif isinstance(item, dict):
@@ -559,6 +563,8 @@ def parse_tool_result_content(content):
     if isinstance(content, dict):
         if content.get("type") == "text":
             return content.get("text", "")
+        if content.get("type") == "image":
+            return "[image returned directly to the model]"
         try:
             return json.dumps(content)
         except:
@@ -569,6 +575,100 @@ def parse_tool_result_content(content):
         return str(content)
     except:
         return "Unparseable content"
+
+
+def _openai_image_block(item):
+    """Convert Anthropic/MCP image content to OpenAI's image_url format."""
+    if not isinstance(item, dict):
+        return None
+    if item.get("type") == "image_url":
+        image_url = item.get("image_url")
+        if isinstance(image_url, dict) and image_url.get("url"):
+            return item
+        return None
+    if item.get("type") != "image":
+        return None
+
+    source = item.get("source")
+    if isinstance(source, dict):
+        source_type = source.get("type")
+        if source_type == "base64" and source.get("data"):
+            media_type = source.get("media_type", "image/png")
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{media_type};base64,{source['data']}",
+                },
+            }
+        if source_type in ("url", "uri"):
+            url = source.get("url") or source.get("uri")
+            if url:
+                return {"type": "image_url", "image_url": {"url": url}}
+
+    # MCP ImageContent uses top-level data + mimeType rather than source.
+    data = item.get("data")
+    if data:
+        media_type = item.get("mimeType", "image/png")
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{media_type};base64,{data}",
+            },
+        }
+    return None
+
+
+def extract_tool_result_images(content):
+    """Extract images nested in an Anthropic tool_result, preserving order."""
+    items = content if isinstance(content, list) else [content]
+    images = []
+    for item in items:
+        image = _openai_image_block(item)
+        if image is not None:
+            images.append(image)
+    return images
+
+
+def _normalize_openai_multimodal_blocks(content):
+    """Return a safe text/image_url list, or None when content has no image."""
+    if not isinstance(content, list):
+        return None
+    if not any(_openai_image_block(block) is not None for block in content):
+        return None
+
+    normalized = []
+    for block in content:
+        if isinstance(block, str):
+            normalized.append({"type": "text", "text": block})
+            continue
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            normalized.append({"type": "text", "text": block.get("text", "")})
+            continue
+        image = _openai_image_block(block)
+        if image is not None:
+            normalized.append(image)
+            continue
+        if block_type == "tool_result":
+            tool_id = block.get("tool_use_id", "unknown")
+            normalized.append({
+                "type": "text",
+                "text": (
+                    f"[Tool Result ID: {tool_id}]\n"
+                    + parse_tool_result_content(block.get("content"))
+                ),
+            })
+        elif block_type == "tool_use":
+            tool_name = block.get("name", "unknown")
+            tool_input = json.dumps(block.get("input", {}), ensure_ascii=False)
+            normalized.append({
+                "type": "text",
+                "text": f"[Tool: {tool_name}]\nInput: {tool_input}",
+            })
+    return normalized or None
+
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     """Convert Anthropic API request format to LiteLLM format (which follows OpenAI)."""
@@ -658,7 +758,12 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             if btype == "text":
                 user_text_parts.append(_block_attr(block, "text", "") or "")
             elif btype == "image":
-                user_image_blocks.append({"type": "image", "source": _block_attr(block, "source", {})})
+                image = _openai_image_block({
+                    "type": "image",
+                    "source": _block_attr(block, "source", {}),
+                })
+                if image is not None:
+                    user_image_blocks.append(image)
             elif btype == "tool_use":
                 # Anthropic spec doesn't put tool_use on user messages, but tolerate it.
                 user_text_parts.append(
@@ -666,12 +771,20 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 )
             elif btype == "tool_result":
                 tool_id = _block_attr(block, "tool_use_id", "") or ""
-                result_text = parse_tool_result_content(_block_attr(block, "content"))
+                result_content = _block_attr(block, "content")
+                result_text = parse_tool_result_content(result_content)
+                result_images = extract_tool_result_images(result_content)
                 tool_messages.append({
                     "role": "tool",
                     "tool_call_id": tool_id,
                     "content": result_text,
                 })
+                if result_images:
+                    user_text_parts.append(
+                        f"The preceding tool result returned {len(result_images)} "
+                        "image(s). Inspect them directly in the documented order."
+                    )
+                    user_image_blocks.extend(result_images)
 
         # tool messages must come right after the assistant's tool_calls message
         # and before any follow-up user text, per OpenAI's chat schema.
@@ -1502,25 +1615,27 @@ async def create_message(
                     # Plain user/assistant/system messages: collapse list content to string,
                     # preserving any tool_use / tool_result that slipped through (defensive).
                     if isinstance(content, list):
-                        text_content = ""
-                        for block in content:
-                            if not isinstance(block, dict):
-                                continue
-                            btype = block.get("type")
-                            if btype == "text":
-                                text_content += block.get("text", "") + "\n"
-                            elif btype == "tool_result":
-                                tool_id = block.get("tool_use_id", "unknown")
-                                text_content += f"[Tool Result ID: {tool_id}]\n"
-                                text_content += parse_tool_result_content(block.get("content")) + "\n"
-                            elif btype == "tool_use":
-                                tool_name = block.get("name", "unknown")
-                                tool_id = block.get("id", "unknown")
-                                tool_input = json.dumps(block.get("input", {}), ensure_ascii=False)
-                                text_content += f"[Tool: {tool_name} (ID: {tool_id})]\nInput: {tool_input}\n\n"
-                            elif btype == "image":
-                                text_content += "[Image content - not displayed in text format]\n"
-                        msg["content"] = text_content.strip() or "..."
+                        multimodal = _normalize_openai_multimodal_blocks(content)
+                        if multimodal is not None:
+                            msg["content"] = multimodal
+                        else:
+                            text_content = ""
+                            for block in content:
+                                if not isinstance(block, dict):
+                                    continue
+                                btype = block.get("type")
+                                if btype == "text":
+                                    text_content += block.get("text", "") + "\n"
+                                elif btype == "tool_result":
+                                    tool_id = block.get("tool_use_id", "unknown")
+                                    text_content += f"[Tool Result ID: {tool_id}]\n"
+                                    text_content += parse_tool_result_content(block.get("content")) + "\n"
+                                elif btype == "tool_use":
+                                    tool_name = block.get("name", "unknown")
+                                    tool_id = block.get("id", "unknown")
+                                    tool_input = json.dumps(block.get("input", {}), ensure_ascii=False)
+                                    text_content += f"[Tool: {tool_name} (ID: {tool_id})]\nInput: {tool_input}\n\n"
+                            msg["content"] = text_content.strip() or "..."
                     elif content is None:
                         msg["content"] = "..."
 
@@ -1534,8 +1649,17 @@ async def create_message(
             for i, msg in enumerate(litellm_request["messages"]):
                 logger.debug(f"Message {i} format check - role: {msg.get('role')}, content type: {type(msg.get('content'))}")
                 if isinstance(msg.get("content"), list):
-                    logger.warning(f"CRITICAL: Message {i} still has list content after processing")
-                    msg["content"] = json.dumps(msg.get("content"), ensure_ascii=False)
+                    blocks = msg["content"]
+                    is_multimodal = (
+                        any(isinstance(block, dict) and block.get("type") == "image_url"
+                            for block in blocks)
+                        and all(isinstance(block, dict)
+                                and block.get("type") in ("text", "image_url")
+                                for block in blocks)
+                    )
+                    if not is_multimodal:
+                        logger.warning(f"CRITICAL: Message {i} still has list content after processing")
+                        msg["content"] = json.dumps(msg.get("content"), ensure_ascii=False)
                 elif msg.get("content") is None and not msg.get("tool_calls"):
                     logger.warning(f"Message {i} has None content - replacing with placeholder")
                     msg["content"] = "..."
